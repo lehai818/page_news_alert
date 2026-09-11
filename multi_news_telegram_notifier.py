@@ -17,7 +17,7 @@ Hệ thống giám sát và bắn tin tức tự động 24/7 qua Telegram:
    - Tự động phục hồi khi mất mạng, xử lý tín hiệu dừng an toàn (Graceful Shutdown)
 =============================================================================
 """
-
+from __future__ import annotations
 import os
 import sys
 import time
