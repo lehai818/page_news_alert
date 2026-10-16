@@ -25,6 +25,8 @@ Hệ thống giám sát và bắn tin tức tự động 24/7 qua Telegram:
 =============================================================================
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import time
@@ -38,6 +40,7 @@ import requests
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from typing import Optional, Union, List, Dict, Tuple
 
 # =====================================================================
 # ⚙️ 1. CẤU HÌNH HỆ THỐNG & NẠP BIẾN MÔI TRƯỜNG
@@ -135,6 +138,14 @@ CONFIG = {
         "TAG_URL": "https://beebom.com/tag/roblox-codes/",
         "API_URL": "https://beebom.com/wp-json/wp/v2/posts?tags=253215&per_page=15",
         "POLL_INTERVAL_SECONDS": 180,  # Quét mỗi 3 phút
+    },
+
+    # Cấu hình nguồn Bizztor Startup & VC News (https://bizztor.com/news/)
+    "BIZZTOR": {
+        "ENABLE": True,
+        "BASE_URL": "https://bizztor.com/news/",
+        "POLL_INTERVAL_SECONDS": 300,  # Quét mỗi 5 phút
+        "TIMEOUT": 15,
     },
 }
 
@@ -630,6 +641,82 @@ class TelegramAlertService:
             print(f"✅ [Telegram] Đã bắn Batch TechCrunch ({count} bài).")
         return success
 
+    def notify_bizztor_article(self, article: dict) -> bool:
+        """Format và gửi tin tức gọi vốn / Startup từ Bizztor."""
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        amount = article.get("amount_formatted", "Không công bố")
+        round_type = article.get("round_type", "Fundraising")
+        excerpt = html.escape(article.get("excerpt", ""))
+        date_str = article.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        badge = "💰 <b>[BIZZTOR - STARTUP & VC FUNDING]</b>"
+        detail_lines = []
+        if amount and amount != "Không công bố":
+            detail_lines.append(f"💵 <b>Quy mô Deal:</b> <b>{amount}</b>")
+        if round_type and round_type != "Fundraising":
+            detail_lines.append(f"🎯 <b>Vòng gọi vốn:</b> {round_type}")
+
+        details_str = ("\n" + "\n".join(detail_lines)) if detail_lines else ""
+        excerpt_block = f"\n📝 <i>{excerpt[:200]}...</i>\n" if excerpt else "\n"
+
+        msg = (
+            f"{badge}\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}"
+            f"{details_str}\n"
+            f"{excerpt_block}"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Xem chi tiết:</b> <a href='{url}'>Mở bài viết trên Bizztor</a>\n\n"
+            f"🏷️ <i>#Bizztor #StartupFunding #VentureCapital #AI #TechNews</i>"
+        )
+        success = self.send_message(msg)
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo Bizztor: {title[:50]}...")
+        return success
+
+    def notify_bizztor_batch(self, articles: list[dict]) -> bool:
+        """Gom nhiều bài Bizztor vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return True
+        if len(articles) == 1:
+            return self.notify_bizztor_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"💼 <b>[BIZZTOR - TỔNG HỢP {count} TIN FUNDRAISING MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            amount = art.get("amount_formatted", "")
+            round_type = art.get("round_type", "")
+            date_str = art.get("date_str", "")
+
+            deal_tag = ""
+            if amount and amount != "Không công bố":
+                deal_tag = f" | 💵 {amount}"
+                if round_type and round_type != "Fundraising":
+                    deal_tag += f" ({round_type})"
+
+            item = (
+                f"<b>{i}️⃣ 🚀 {title}</b>{deal_tag}\n"
+                f"   ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Đọc bài gốc trên Bizztor</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#Bizztor #BatchDigest #VentureCapital #StartupNews</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg)
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch Bizztor ({count} bài).")
+        return success
+
 
 # =====================================================================
 # 🔍 4. BỘ QUÉT NGUỒN BINANCE ANNOUNCEMENTS
@@ -996,7 +1083,7 @@ class TelegramChannelScanner:
             return "", ""
         return match.group(1).replace(" ", ""), match.group(2).strip()
 
-    def _parse_message(self, msg) -> dict | None:
+    def _parse_message(self, msg) -> Optional[dict]:
         """Bóc tách 1 khối message của t.me/s thành dict chuẩn hóa, None nếu bỏ qua."""
         text_div = msg.select_one(".tgme_widget_message_text")
         if text_div is None:
@@ -1020,7 +1107,9 @@ class TelegramChannelScanner:
         if time_tag:
             raw_dt = time_tag.get("datetime", "")
             try:
-                dt_utc = datetime.fromisoformat(raw_dt)
+                # Python 3.8 không hỗ trợ hậu tố 'Z' trong fromisoformat
+                clean_dt = raw_dt.replace("Z", "+00:00")
+                dt_utc = datetime.fromisoformat(clean_dt)
                 date_str = (dt_utc + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M")
             except ValueError:
                 print(f"⚠️ [CryptoRank] datetime lạ '{raw_dt}' ở tin {data_post}, dùng thời gian hiện tại.")
@@ -1153,7 +1242,9 @@ class TechCrunchScanner:
                 continue
 
             try:
-                dt = datetime.fromisoformat(date_raw)
+                # Python 3.8 không hỗ trợ hậu tố 'Z' trong fromisoformat
+                clean_date = date_raw.replace("Z", "+00:00") if date_raw else ""
+                dt = datetime.fromisoformat(clean_date)
                 date_str = dt.strftime("%Y-%m-%d %H:%M")
             except ValueError:
                 date_str = date_raw[:16].replace("T", " ") if date_raw else datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1174,7 +1265,132 @@ class TechCrunchScanner:
 
 
 # =====================================================================
-# 🚀 8. DAEMON CHÍNH CHẠY NGẦM 24/7 (ASYNC ENGINE)
+# 🔍 8. BỘ QUÉT NGUỒN BIZZZTOR (STARTUP & VC FUNDING NEWS)
+# =====================================================================
+class BizztorScanner:
+    """Cào bài viết mới nhất từ chuyên mục tin tức Bizztor (https://bizztor.com/news/)."""
+
+    def __init__(self, config: dict):
+        self.base_url = config.get("BASE_URL", "https://bizztor.com/news/")
+        self.timeout = config.get("TIMEOUT", 15)
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    @staticmethod
+    def _extract_amount_and_round(title: str) -> tuple[str, str]:
+        """Trích xuất quy mô vốn ($/€/£) và vòng gọi vốn từ tiêu đề bài viết Bizztor."""
+        # 1. Regex tìm số tiền: $125M, €60M, £4.6M, $2.1 Billion, £200,000, $50M...
+        amount = "Không công bố"
+        amount_match = re.search(
+            r'([$€£]\s*[\d]+(?:\.[\d]+)?\s*(?:Billion|Million|B|M|k|K)?|[\d]+(?:\.[\d]+)?\s*(?:million|billion)\s*(?:pounds|euros|dollars)?)',
+            title,
+            re.IGNORECASE
+        )
+        if amount_match:
+            amount = amount_match.group(1).strip()
+
+        # 2. Regex tìm vòng gọi vốn: Pre-Seed, Seed, Series A-F...
+        round_type = "Fundraising"
+        round_match = re.search(
+            r'\b(Pre-Seed|Seed|Series\s+[A-F](?:\s+Extension)?|Growth|First Close|Debt|Bridge|Grant)\b',
+            title,
+            re.IGNORECASE
+        )
+        if round_match:
+            round_type = round_match.group(1).strip()
+
+        return amount, round_type
+
+    def _parse_html(self, html_text: str) -> list[dict]:
+        """Tách riêng logic parse HTML để có thể kiểm thử (unit test) offline không cần mạng."""
+        soup = BeautifulSoup(html_text, "html.parser")
+        articles = []
+        seen_slugs = set()
+
+        # Bizztor đặt tiêu đề tin trong h2/h3 kèm thẻ a có href chứa /news/
+        for h in soup.find_all(["h2", "h3"]):
+            a = h.find("a")
+            if not a:
+                continue
+
+            href = (a.get("href") or "").strip()
+            if not href or href in ("https://bizztor.com/news/", "/news/", "https://bizztor.com/news"):
+                continue
+
+            # Chuẩn hóa URL tuyệt đối
+            if href.startswith("/"):
+                url = "https://bizztor.com" + href
+            else:
+                url = href
+
+            # Trích xuất slug bài viết làm article_id
+            clean_path = href.split("?")[0].rstrip("/")
+            slug = clean_path.split("/")[-1]
+            if not slug or slug in ("news", "page") or slug.startswith("page"):
+                continue
+
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+
+            title = a.get_text(strip=True)
+            if not title or len(title) < 15:
+                continue
+
+            amount, round_type = self._extract_amount_and_round(title)
+
+            # Tìm đoạn văn tóm tắt lân cận (nếu có)
+            excerpt = ""
+            parent = h.find_parent()
+            if parent:
+                p_tag = parent.find("p")
+                if p_tag:
+                    excerpt = p_tag.get_text(strip=True)
+
+            date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            articles.append({
+                "source": "BIZZTOR",
+                "article_id": slug,
+                "title": title,
+                "url": url,
+                "excerpt": excerpt,
+                "amount_formatted": amount,
+                "round_type": round_type,
+                "date_str": date_str,
+            })
+
+        return articles
+
+    def fetch_latest_articles(self) -> list[dict]:
+        """Gửi request cào danh sách bài viết từ https://bizztor.com/news/."""
+        try:
+            resp = requests.get(self.base_url, headers=self.headers, timeout=self.timeout)
+            if resp.status_code == 200:
+                articles = self._parse_html(resp.text)
+                return articles
+            elif resp.status_code == 429:
+                print(f"⚠️ [Bizztor] Bị giới hạn tần suất (HTTP 429).")
+                return []
+            else:
+                print(f"⚠️ [Bizztor] Lỗi HTTP {resp.status_code} khi tải {self.base_url}")
+                return []
+        except requests.Timeout:
+            print(f"⚠️ [Bizztor] Hết thời gian chờ (Timeout {self.timeout}s) khi kết nối {self.base_url}")
+            return []
+        except Exception as e:
+            print(f"⚠️ [Bizztor] Lỗi khi cào dữ liệu: {e}")
+            return []
+
+
+# =====================================================================
+# 🚀 9. DAEMON CHÍNH CHẠY NGẦM 24/7 (ASYNC ENGINE)
 # =====================================================================
 class MultiNewsNotifierDaemon:
     """Điều phối toàn bộ vòng lặp kiểm tra và thông báo tin mới đa nguồn."""
@@ -1187,6 +1403,7 @@ class MultiNewsNotifierDaemon:
         self.beebom_scanner = BeebomScanner(config=CONFIG.get("BEEBOM", {}))
         self.cryptorank_scanner = TelegramChannelScanner(config=CONFIG["CRYPTORANK"])
         self.techcrunch_scanner = TechCrunchScanner(config=CONFIG.get("TECHCRUNCH", {}))
+        self.bizztor_scanner = BizztorScanner(config=CONFIG.get("BIZZTOR", {}))
 
     def initialize_baseline(self):
         """
@@ -1198,7 +1415,8 @@ class MultiNewsNotifierDaemon:
         print(
             f"📌 Trạng thái SQLite: {self.storage.count_seen()} tin đã ghi nhận "
             f"(Binance: {self.storage.count_seen('BINANCE')} | Dealroom: {self.storage.count_seen('DEALROOM')} | "
-            f"Beebom: {self.storage.count_seen('BEEBOM')} | CryptoRank: {self.storage.count_seen('CRYPTORANK')})"
+            f"Beebom: {self.storage.count_seen('BEEBOM')} | CryptoRank: {self.storage.count_seen('CRYPTORANK')} | "
+            f"TechCrunch: {self.storage.count_seen('TECHCRUNCH')} | Bizztor: {self.storage.count_seen('BIZZTOR')})"
         )
 
     def _process_source_items(self, source: str, items: list[dict], notify_single, notify_batch, mark_one) -> int:
@@ -1374,6 +1592,33 @@ class MultiNewsNotifierDaemon:
             ),
         )
 
+    def check_bizztor_now(self):
+        """Quét bài viết Bizztor Startup News và xử lý tin mới (Batch)."""
+        if not CONFIG.get("BIZZTOR", {}).get("ENABLE", False):
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét Bizztor Startup News...")
+        articles = self.bizztor_scanner.fetch_latest_articles()
+        if not articles:
+            print(f"[{now_str}] ℹ️ Bizztor: Không có dữ liệu.")
+            return
+
+        self._process_source_items(
+            source="BIZZTOR",
+            items=articles,
+            notify_single=self.telegram.notify_bizztor_article,
+            notify_batch=self.telegram.notify_bizztor_batch,
+            mark_one=lambda art: self.storage.mark_seen(
+                source="BIZZTOR",
+                article_id=art["article_id"],
+                catalog_or_lens="news",
+                title=art["title"],
+                url=art["url"],
+                amount=art.get("amount_formatted", ""),
+            ),
+        )
+
     async def run_daemon(self):
         """Vòng lặp chạy ngầm chính bất đồng bộ."""
         print("=" * 75)
@@ -1392,7 +1637,8 @@ class MultiNewsNotifierDaemon:
             f"Dealroom ({dealroom_status}) | "
             f"Beebom ({CONFIG.get('BEEBOM', {}).get('POLL_INTERVAL_SECONDS', 180)}s) | "
             f"CryptoRank TG ({CONFIG['CRYPTORANK']['POLL_INTERVAL_SECONDS']}s) | "
-            f"TechCrunch ({CONFIG.get('TECHCRUNCH', {}).get('POLL_INTERVAL_SECONDS', 300)}s)"
+            f"TechCrunch ({CONFIG.get('TECHCRUNCH', {}).get('POLL_INTERVAL_SECONDS', 300)}s) | "
+            f"Bizztor ({CONFIG.get('BIZZTOR', {}).get('POLL_INTERVAL_SECONDS', 300)}s)"
         )
         print("=" * 75)
 
@@ -1404,12 +1650,14 @@ class MultiNewsNotifierDaemon:
         beebom_interval = CONFIG.get("BEEBOM", {}).get("POLL_INTERVAL_SECONDS", 180)
         cryptorank_interval = CONFIG["CRYPTORANK"]["POLL_INTERVAL_SECONDS"]
         techcrunch_interval = CONFIG.get("TECHCRUNCH", {}).get("POLL_INTERVAL_SECONDS", 300)
+        bizztor_interval = CONFIG.get("BIZZTOR", {}).get("POLL_INTERVAL_SECONDS", 300)
 
         last_binance_check = 0.0
         last_dealroom_check = 0.0
         last_beebom_check = 0.0
         last_cryptorank_check = 0.0
         last_techcrunch_check = 0.0
+        last_bizztor_check = 0.0
 
         print("🟢 HỆ THỐNG ĐÃ SẴN SÀNG VÀ BẮT ĐẦU LẮNG NGHE TIN TỨC 24/7...\n")
 
@@ -1455,6 +1703,14 @@ class MultiNewsNotifierDaemon:
                 except Exception as e:
                     print(f"⚠️ Lỗi chu kỳ TechCrunch: {e}")
                 last_techcrunch_check = time.time()
+
+            # 6. Quét Bizztor Startup News theo chu kỳ
+            if now - last_bizztor_check >= bizztor_interval:
+                try:
+                    self.check_bizztor_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ Bizztor: {e}")
+                last_bizztor_check = time.time()
 
             # Sleep ngắn để kiểm tra cờ tắt chương trình thường xuyên
             await asyncio.sleep(2)
