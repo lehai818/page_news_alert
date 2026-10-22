@@ -55,7 +55,6 @@ load_dotenv(os.path.join(BASE_DIR, "key.env"))
 TELEGRAM_BOT_TOKEN = (
     os.getenv("news_bot_token")
     or os.getenv("trading_bot_token")
-    or "8736373193:AAF_HBdPgpDPbrM-2PCgY5gZaZX4ly0SKLM"
 )
 TELEGRAM_CHAT_ID = os.getenv("tk_chatid", "-1004422031564")
 
