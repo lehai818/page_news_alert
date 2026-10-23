@@ -56,7 +56,7 @@ TELEGRAM_BOT_TOKEN = (
     os.getenv("news_bot_token")
     or os.getenv("trading_bot_token")
 )
-TELEGRAM_CHAT_ID = os.getenv("tk_chatid", "-1004422031564")
+TELEGRAM_CHAT_ID = os.getenv("tk_news_personal_chatid", "-1004422031564")
 
 CONFIG = {
     # Đường dẫn file database SQLite (Tự động tạo ngay tại thư mục hiện tại)
