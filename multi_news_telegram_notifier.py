@@ -17,7 +17,13 @@ Hệ thống giám sát và bắn tin tức tự động 24/7 qua Telegram:
 4. Nguồn TechCrunch Fundraising (bổ sung 2026-10-15, thay thế vai trò Dealroom):
    - WP-JSON REST API category "Fundraising" (id 577234943) của techcrunch.com.
    - Lọc từ khóa tiêu đề để loại bỏ bài sự kiện/quảng cáo lẫn trong category.
-5. Cơ chế hoạt động:
+5. Nguồn OKX Announcements (bổ sung 2026-11-06):
+   - REST API công khai GET /api/v5/support/announcements (toàn bộ chuyên mục).
+   - Tiêu đề tiếng Việt qua header Accept-Language: vi-VN.
+6. Nguồn MEXC (bổ sung 2026-11-06):
+   - mexc.com chặn mọi client không phải trình duyệt (Akamai 403) => quét kênh Telegram
+     chính thức @MEXC_OfficialAnnouncements (link từ trang MEXC), lọc theo hashtag.
+7. Cơ chế hoạt động:
    - Lưu vết bài viết bằng SQLite (không cần cài đặt server DB, tự sinh file .db)
    - Lần đầu chạy: Tự động ghi nhớ các bài hiện có làm mốc, KHÔNG bị spam tin cũ
    - Khi có bài mới: Bắn thông báo Telegram tức thì (Định dạng HTML đẹp mắt)
@@ -83,6 +89,31 @@ CONFIG = {
         ],
         "BASE_URL": "https://www.binance.com/en/support/announcement",
         "POLL_INTERVAL_SECONDS": 45,  # Quét mỗi 45 giây
+    },
+
+    # Cấu hình nguồn OKX Announcements (REST API công khai chính thức /api/v5/support)
+    "OKX": {
+        "ENABLE": True,
+        # Không truyền annType => lấy toàn bộ mục "Thông báo mới nhất" (giống trang
+        # https://www.okx.com/vi/help/section/announcements-latest-announcements)
+        "API_URL": "https://www.okx.com/api/v5/support/announcements",
+        "LANGUAGE": "vi-VN",  # Tiêu đề tiếng Việt; đổi "en-US" để lấy tiếng Anh
+        "POLL_INTERVAL_SECONDS": 120,  # Quét mỗi 2 phút
+        "TIMEOUT": 15,
+    },
+
+    # Cấu hình nguồn MEXC qua kênh Telegram thông báo chính thức (mexc.com chặn bot 403)
+    "MEXC": {
+        "ENABLE": True,
+        "CHANNEL": "MEXC_OfficialAnnouncements",
+        "WEB_URL": "https://t.me/s/MEXC_OfficialAnnouncements",
+        "LOG_NAME": "MEXC",
+        # Chỉ gửi tin có hashtag trong danh sách (kênh đăng ~20 tin/ngày, phần lớn là
+        # #Trading_Updates chỉnh phí/đòn bẩy). Các tag hiện có: Latest_Events, New_Listings,
+        # Delistings, 0_Fees, Trading_Updates, Maintenance_Updates, Product_Updates, MEXC_News.
+        # Để danh sách rỗng [] nếu muốn nhận TẤT CẢ.
+        "INCLUDE_TAGS": ["Latest_Events", "0_Fees"],
+        "POLL_INTERVAL_SECONDS": 300,  # Quét mỗi 5 phút
     },
     
     # Cấu hình nguồn Dealroom.co
@@ -716,6 +747,118 @@ class TelegramAlertService:
             print(f"✅ [Telegram] Đã bắn Batch Bizztor ({count} bài).")
         return success
 
+    def notify_okx_article(self, article: dict) -> bool:
+        """Format và gửi thông báo OKX."""
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        type_name = html.escape(article.get("type_name", "Thông báo"))
+        date_str = article.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        msg = (
+            f"⚫ <b>[OKX ANNOUNCEMENT]</b>\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}\n"
+            f"📂 <b>Chuyên mục:</b> {type_name}\n"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Link OKX:</b> <a href='{url}'>Xem thông báo gốc trên OKX</a>\n\n"
+            f"🏷️ <i>#OKX #CryptoNews</i>"
+        )
+        success = self.send_message(msg)
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo OKX: {title[:50]}...")
+        return success
+
+    def notify_okx_batch(self, articles: list[dict]) -> bool:
+        """Gom nhiều thông báo OKX vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return True
+        if len(articles) == 1:
+            return self.notify_okx_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"⚫ <b>[OKX - TỔNG HỢP {count} THÔNG BÁO MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            type_name = html.escape(art.get("type_name", ""))
+            date_str = art.get("date_str", "")
+
+            item = (
+                f"<b>{i}️⃣ 📢 {title}</b>\n"
+                f"   📂 {type_name} | ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Xem thông báo gốc trên OKX</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#OKX #BatchDigest #CryptoNews</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg)
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch OKX ({count} thông báo).")
+        return success
+
+    def notify_mexc_article(self, article: dict) -> bool:
+        """Format và gửi thông báo MEXC."""
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        category = html.escape(article.get("category", "Announcement"))
+        date_str = article.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        msg = (
+            f"🔵 <b>[MEXC ANNOUNCEMENT]</b>\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}\n"
+            f"📂 <b>Chuyên mục:</b> {category}\n"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Link MEXC:</b> <a href='{url}'>Xem thông báo gốc trên MEXC</a>\n\n"
+            f"🏷️ <i>#MEXC #CryptoNews</i>"
+        )
+        success = self.send_message(msg)
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo MEXC: {title[:50]}...")
+        return success
+
+    def notify_mexc_batch(self, articles: list[dict]) -> bool:
+        """Gom nhiều thông báo MEXC vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return True
+        if len(articles) == 1:
+            return self.notify_mexc_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"🔵 <b>[MEXC - TỔNG HỢP {count} THÔNG BÁO MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            category = html.escape(art.get("category", ""))
+            date_str = art.get("date_str", "")
+
+            item = (
+                f"<b>{i}️⃣ 📢 {title}</b>\n"
+                f"   📂 {category} | ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Xem thông báo gốc trên MEXC</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#MEXC #BatchDigest #CryptoNews</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg)
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch MEXC ({count} thông báo).")
+        return success
+
 
 # =====================================================================
 # 🔍 4. BỘ QUÉT NGUỒN BINANCE ANNOUNCEMENTS
@@ -1051,6 +1194,8 @@ class TelegramChannelScanner:
     def __init__(self, config: dict):
         self.channel = config.get("CHANNEL", "cryptorank_fundraising")
         self.web_url = config.get("WEB_URL", f"https://t.me/s/{self.channel}")
+        # Nhãn in log (dùng chung class cho nhiều kênh: CryptoRank, MEXC, ...)
+        self.log_name = config.get("LOG_NAME", "CryptoRank")
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -1111,7 +1256,7 @@ class TelegramChannelScanner:
                 dt_utc = datetime.fromisoformat(clean_dt)
                 date_str = (dt_utc + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M")
             except ValueError:
-                print(f"⚠️ [CryptoRank] datetime lạ '{raw_dt}' ở tin {data_post}, dùng thời gian hiện tại.")
+                print(f"⚠️ [{self.log_name}] datetime lạ '{raw_dt}' ở tin {data_post}, dùng thời gian hiện tại.")
 
         amount, round_type = self._parse_amount_round(full_text)
 
@@ -1139,13 +1284,13 @@ class TelegramChannelScanner:
         try:
             resp = requests.get(self.web_url, headers=self.headers, timeout=15)
             if resp.status_code == 429:
-                print("⚠️ [CryptoRank] Telegram đang throttle (HTTP 429), đợi chu kỳ kế tiếp.")
+                print(f"⚠️ [{self.log_name}] Telegram đang throttle (HTTP 429), đợi chu kỳ kế tiếp.")
                 return []
             if resp.status_code != 200:
-                print(f"⚠️ [CryptoRank] HTTP {resp.status_code} khi tải {self.web_url}")
+                print(f"⚠️ [{self.log_name}] HTTP {resp.status_code} khi tải {self.web_url}")
                 return []
         except requests.RequestException as e:
-            print(f"⚠️ [CryptoRank] Lỗi kết nối t.me: {e}")
+            print(f"⚠️ [{self.log_name}] Lỗi kết nối t.me: {e}")
             return []
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -1157,8 +1302,44 @@ class TelegramChannelScanner:
                 results[parsed["article_id"]] = parsed
 
         if not results:
-            print("⚠️ [CryptoRank] Tải trang OK nhưng parse được 0 tin — DOM của t.me/s có thể đã đổi, cần kiểm tra lại parser!")
+            print(f"⚠️ [{self.log_name}] Tải trang OK nhưng parse được 0 tin — DOM của t.me/s có thể đã đổi, cần kiểm tra lại parser!")
         return list(results.values())
+
+
+class MEXCChannelScanner(TelegramChannelScanner):
+    """
+    Quét kênh Telegram thông báo chính thức của MEXC (@MEXC_OfficialAnnouncements,
+    được dẫn link từ mexc.com). Lý do không quét mexc.com trực tiếp: toàn bộ site
+    chặn client không phải trình duyệt bằng Akamai (HTTP 403).
+    Mỗi tin kết thúc bằng hashtag chuyên mục (#Latest_Events, #New_Listings, ...).
+    """
+
+    _TAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
+
+    def _parse_message(self, msg) -> Optional[dict]:
+        parsed = super()._parse_message(msg)
+        if parsed is None:
+            return None
+
+        tags = self._TAG_RE.findall(parsed["full_text"])
+        # Link bài gốc trên mexc.com nằm ở nút inline bên dưới tin (ngoài khối text);
+        # bỏ tham số utm cho gọn
+        article_url = ""
+        for a_tag in msg.find_all("a", href=True):
+            if "mexc.com/announcements/article/" in a_tag["href"]:
+                article_url = a_tag["href"].split("?", 1)[0]
+                break
+
+        return {
+            "source": "MEXC",
+            "article_id": parsed["article_id"],
+            "title": parsed["title"],
+            "url": article_url or parsed["url"],
+            "tg_url": parsed["url"],
+            "tags": tags,
+            "category": tags[-1].replace("_", " ") if tags else "Announcement",
+            "date_str": parsed["date_str"],
+        }
 
 
 # =====================================================================
@@ -1389,6 +1570,90 @@ class BizztorScanner:
 
 
 # =====================================================================
+# 🔍 8b. BỘ QUÉT NGUỒN OKX ANNOUNCEMENTS (REST API CÔNG KHAI)
+# =====================================================================
+class OKXScanner:
+    """Truy vấn API thông báo công khai của OKX (GET /api/v5/support/announcements)."""
+
+    # Nhãn chuyên mục (theo /api/v5/support/announcement-types, bản vi-VN)
+    TYPE_NAMES = {
+        "announcements-new-listings": "Token mới niêm yết",
+        "announcements-delistings": "Hủy niêm yết",
+        "latest-events": "Sự kiện mới nhất",
+        "announcements-trading-updates": "Cập nhật giao dịch",
+        "announcements-deposit-withdrawal-suspension-resumption": "Tạm ngưng nạp/rút",
+        "announcements-p2p-trading": "Giao dịch P2P",
+        "announcements-web3": "Web3",
+        "announcements-earn-and-loan": "Earn và Vay",
+        "announcements-jumpstart": "Jumpstart",
+        "announcements-api": "API",
+        "announcements-okb-buy-back-burn": "Đốt OKB",
+        "announcements-others": "Khác",
+    }
+
+    def __init__(self, config: dict):
+        self.api_url = config.get("API_URL", "https://www.okx.com/api/v5/support/announcements")
+        self.timeout = config.get("TIMEOUT", 15)
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Accept-Language": config.get("LANGUAGE", "vi-VN"),
+        }
+
+    def fetch_latest_articles(self) -> list[dict]:
+        """Lấy trang đầu (20 thông báo mới nhất) của toàn bộ chuyên mục."""
+        try:
+            resp = requests.get(self.api_url, headers=self.headers, timeout=self.timeout)
+            if resp.status_code != 200:
+                print(f"⚠️ [OKX] Lỗi HTTP {resp.status_code} khi gọi API thông báo")
+                return []
+
+            payload = resp.json()
+            if str(payload.get("code")) != "0":
+                print(f"⚠️ [OKX] API trả lỗi code={payload.get('code')}: {payload.get('msg')}")
+                return []
+
+            results = []
+            for page in payload.get("data") or []:
+                for ann in page.get("details") or []:
+                    url = (ann.get("url") or "").strip()
+                    title = html.unescape(ann.get("title") or "").strip()
+                    if not url or not title:
+                        continue
+
+                    # Slug cuối URL không phụ thuộc ngôn ngữ (/vi/help/x == /help/x)
+                    # => đổi LANGUAGE cũng không bị bắn lại tin cũ
+                    article_id = url.rstrip("/").rsplit("/", 1)[-1]
+
+                    ann_type = ann.get("annType", "")
+                    p_time = ann.get("pTime")
+                    try:
+                        date_str = datetime.fromtimestamp(int(p_time) / 1000).strftime("%Y-%m-%d %H:%M")
+                    except (TypeError, ValueError):
+                        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+                    results.append({
+                        "source": "OKX",
+                        "article_id": article_id,
+                        "ann_type": ann_type,
+                        "type_name": self.TYPE_NAMES.get(ann_type, ann_type or "Thông báo"),
+                        "title": title,
+                        "url": url,
+                        "date_str": date_str,
+                    })
+            return results
+        except requests.Timeout:
+            print(f"⚠️ [OKX] Hết thời gian chờ (Timeout {self.timeout}s) khi gọi API")
+            return []
+        except Exception as e:
+            print(f"⚠️ [OKX] Lỗi khi quét thông báo: {e}")
+            return []
+
+
+# =====================================================================
 # 🚀 9. DAEMON CHÍNH CHẠY NGẦM 24/7 (ASYNC ENGINE)
 # =====================================================================
 class MultiNewsNotifierDaemon:
@@ -1403,6 +1668,8 @@ class MultiNewsNotifierDaemon:
         self.cryptorank_scanner = TelegramChannelScanner(config=CONFIG["CRYPTORANK"])
         self.techcrunch_scanner = TechCrunchScanner(config=CONFIG.get("TECHCRUNCH", {}))
         self.bizztor_scanner = BizztorScanner(config=CONFIG.get("BIZZTOR", {}))
+        self.okx_scanner = OKXScanner(config=CONFIG.get("OKX", {}))
+        self.mexc_scanner = MEXCChannelScanner(config=CONFIG.get("MEXC", {}))
 
     def initialize_baseline(self):
         """
@@ -1415,7 +1682,8 @@ class MultiNewsNotifierDaemon:
             f"📌 Trạng thái SQLite: {self.storage.count_seen()} tin đã ghi nhận "
             f"(Binance: {self.storage.count_seen('BINANCE')} | Dealroom: {self.storage.count_seen('DEALROOM')} | "
             f"Beebom: {self.storage.count_seen('BEEBOM')} | CryptoRank: {self.storage.count_seen('CRYPTORANK')} | "
-            f"TechCrunch: {self.storage.count_seen('TECHCRUNCH')} | Bizztor: {self.storage.count_seen('BIZZTOR')})"
+            f"TechCrunch: {self.storage.count_seen('TECHCRUNCH')} | Bizztor: {self.storage.count_seen('BIZZTOR')} | "
+            f"OKX: {self.storage.count_seen('OKX')} | MEXC: {self.storage.count_seen('MEXC')})"
         )
 
     def _process_source_items(self, source: str, items: list[dict], notify_single, notify_batch, mark_one) -> int:
@@ -1618,6 +1886,78 @@ class MultiNewsNotifierDaemon:
             ),
         )
 
+    def check_okx_now(self):
+        """Quét thông báo mới nhất của OKX và xử lý tin mới (Batch)."""
+        if not CONFIG.get("OKX", {}).get("ENABLE", False):
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét thông báo OKX (Latest Announcements)...")
+        articles = self.okx_scanner.fetch_latest_articles()
+        if not articles:
+            print(f"[{now_str}] ℹ️ OKX: Không có dữ liệu.")
+            return
+
+        self._process_source_items(
+            source="OKX",
+            items=articles,
+            notify_single=self.telegram.notify_okx_article,
+            notify_batch=self.telegram.notify_okx_batch,
+            mark_one=lambda art: self.storage.mark_seen(
+                source="OKX",
+                article_id=art["article_id"],
+                catalog_or_lens=art["ann_type"],
+                title=art["title"],
+                url=art["url"],
+            ),
+        )
+
+    def check_mexc_now(self):
+        """Quét kênh Telegram thông báo MEXC, chỉ gửi tin thuộc hashtag đã chọn (Batch)."""
+        mexc_cfg = CONFIG.get("MEXC", {})
+        if not mexc_cfg.get("ENABLE", False):
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét kênh Telegram @{self.mexc_scanner.channel} (MEXC)...")
+        items = self.mexc_scanner.fetch_latest_messages()
+        if not items:
+            print(f"[{now_str}] ℹ️ MEXC: Không tải được tin hoặc không có tin nào.")
+            return
+
+        def mark_one(it):
+            self.storage.mark_seen(
+                source="MEXC",
+                article_id=it["article_id"],
+                catalog_or_lens=",".join(it["tags"]),
+                title=it["title"],
+                url=it["url"],
+            )
+
+        include = set(mexc_cfg.get("INCLUDE_TAGS") or [])
+        wanted = [it for it in items if not include or include.intersection(it["tags"])]
+
+        # Baseline trên TOÀN BỘ tin (không chỉ tin đúng tag): nếu baseline chỉ dựa vào tin
+        # đúng tag thì khi chưa có tin nào khớp, tin khớp đầu tiên sẽ bị nuốt im lặng.
+        if self.storage.count_seen("MEXC") == 0:
+            for it in items:
+                mark_one(it)
+            print(f"📌 [Baseline] Nguồn MEXC: ghi nhớ im lặng {len(items)} tin hiện có (lần đầu tiên).")
+            return
+
+        # Tin ngoài bộ lọc: ghi nhận im lặng để không phải xét lại mỗi chu kỳ
+        for it in items:
+            if it not in wanted and not self.storage.is_seen("MEXC", it["article_id"]):
+                mark_one(it)
+
+        self._process_source_items(
+            source="MEXC",
+            items=wanted,
+            notify_single=self.telegram.notify_mexc_article,
+            notify_batch=self.telegram.notify_mexc_batch,
+            mark_one=mark_one,
+        )
+
     async def run_daemon(self):
         """Vòng lặp chạy ngầm chính bất đồng bộ."""
         print("=" * 75)
@@ -1637,7 +1977,9 @@ class MultiNewsNotifierDaemon:
             f"Beebom ({CONFIG.get('BEEBOM', {}).get('POLL_INTERVAL_SECONDS', 180)}s) | "
             f"CryptoRank TG ({CONFIG['CRYPTORANK']['POLL_INTERVAL_SECONDS']}s) | "
             f"TechCrunch ({CONFIG.get('TECHCRUNCH', {}).get('POLL_INTERVAL_SECONDS', 300)}s) | "
-            f"Bizztor ({CONFIG.get('BIZZTOR', {}).get('POLL_INTERVAL_SECONDS', 300)}s)"
+            f"Bizztor ({CONFIG.get('BIZZTOR', {}).get('POLL_INTERVAL_SECONDS', 300)}s) | "
+            f"OKX ({CONFIG.get('OKX', {}).get('POLL_INTERVAL_SECONDS', 120)}s) | "
+            f"MEXC TG ({CONFIG.get('MEXC', {}).get('POLL_INTERVAL_SECONDS', 300)}s)"
         )
         print("=" * 75)
 
@@ -1650,6 +1992,8 @@ class MultiNewsNotifierDaemon:
         cryptorank_interval = CONFIG["CRYPTORANK"]["POLL_INTERVAL_SECONDS"]
         techcrunch_interval = CONFIG.get("TECHCRUNCH", {}).get("POLL_INTERVAL_SECONDS", 300)
         bizztor_interval = CONFIG.get("BIZZTOR", {}).get("POLL_INTERVAL_SECONDS", 300)
+        okx_interval = CONFIG.get("OKX", {}).get("POLL_INTERVAL_SECONDS", 120)
+        mexc_interval = CONFIG.get("MEXC", {}).get("POLL_INTERVAL_SECONDS", 300)
 
         last_binance_check = 0.0
         last_dealroom_check = 0.0
@@ -1657,6 +2001,8 @@ class MultiNewsNotifierDaemon:
         last_cryptorank_check = 0.0
         last_techcrunch_check = 0.0
         last_bizztor_check = 0.0
+        last_okx_check = 0.0
+        last_mexc_check = 0.0
 
         print("🟢 HỆ THỐNG ĐÃ SẴN SÀNG VÀ BẮT ĐẦU LẮNG NGHE TIN TỨC 24/7...\n")
 
@@ -1710,6 +2056,22 @@ class MultiNewsNotifierDaemon:
                 except Exception as e:
                     print(f"⚠️ Lỗi chu kỳ Bizztor: {e}")
                 last_bizztor_check = time.time()
+
+            # 7. Quét OKX Announcements theo chu kỳ
+            if now - last_okx_check >= okx_interval:
+                try:
+                    self.check_okx_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ OKX: {e}")
+                last_okx_check = time.time()
+
+            # 8. Quét kênh Telegram thông báo MEXC theo chu kỳ
+            if now - last_mexc_check >= mexc_interval:
+                try:
+                    self.check_mexc_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ MEXC: {e}")
+                last_mexc_check = time.time()
 
             # Sleep ngắn để kiểm tra cờ tắt chương trình thường xuyên
             await asyncio.sleep(2)
