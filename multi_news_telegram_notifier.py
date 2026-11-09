@@ -1,2117 +1,2111 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 =============================================================================
-🤖 AUTO BINANCE ANNOUNCEMENT TO WORDPRESS PUBLISHER BOT (24/7 PRODUCTION)
+🤖 MULTI-NEWS TELEGRAM NOTIFIER (24/7 PRODUCTION DAEMON)
+Topic Telegram: Binance/OKX/MEXC -> 2042 | Beebom -> 2045 | Dealroom/TechCrunch/CryptoRank/Bizztor -> 2041
 =============================================================================
-- Module 1: BinanceScanner & NewsExtractor (Quét Catalog 93 & 49, bóc tách AST, Tables, Hình ảnh)
-- Module 2: AIProcessor (Gemini 3.1 Flash Lite - Biên tập bài viết tiếng Anh SEO + Tables chuẩn WP)
-- Module 2.5: AICheckerModule (Gemma 4 31B chấm điểm AI + Gemini Humanize viết lại)
-- Module 3: HFImageEngine (Hugging Face sinh ảnh bìa 16:9 + Watermark Logo CP_white_logo.png)
-- Module 4: WordPressPublisher (Playwright tự động hóa đăng bài nháp Draft lên chainplay.gg)
-- Module 5: CSVLogger (Ghi lịch sử dữ liệu vào file CSV)
-- Module 6: TelegramNotifier (Gửi báo cáo tức thì về Telegram khi lên bài thành công)
-- Module 7: Periodic Scheduler (Chạy định kỳ 10 phút / lần)
+Hệ thống giám sát và bắn tin tức tự động 24/7 qua Telegram:
+1. Nguồn Binance Announcements:
+   - Catalog 49: Latest Binance News (Tin niêm yết, tính năng, chính sách)
+   - Catalog 93: Latest Activities (Sự kiện giao dịch, Airdrop, Giải thưởng)
+2. Nguồn Dealroom Venture Intelligence (⛔ TẠM TẮT từ 2026-10-15):
+   - dealroom.co đã bật Cloudflare Managed Challenge (HTTP 403 "Just a moment...")
+     chặn mọi HTTP client kể cả headless browser => không fetch được nữa.
+   - Giữ nguyên scanner để tái bật khi có giải pháp (stealth browser / scraper API).
+3. Nguồn Telegram Channel @cryptorank_fundraising (CryptoRank Fundraising):
+   - Quét web preview công khai https://t.me/s/cryptorank_fundraising (không cần API).
+   - Tin vòng gọi vốn: Seed, Series A-E, Post-IPO, kèm nhà đầu tư và link dự án.
+4. Nguồn TechCrunch Fundraising (bổ sung 2026-10-15, thay thế vai trò Dealroom):
+   - WP-JSON REST API category "Fundraising" (id 577234943) của techcrunch.com.
+   - Lọc từ khóa tiêu đề để loại bỏ bài sự kiện/quảng cáo lẫn trong category.
+5. Nguồn OKX Announcements (bổ sung 2026-11-06):
+   - REST API công khai GET /api/v5/support/announcements (toàn bộ chuyên mục).
+   - Tiêu đề tiếng Việt qua header Accept-Language: vi-VN.
+6. Nguồn MEXC (bổ sung 2026-11-06):
+   - mexc.com chặn mọi client không phải trình duyệt (Akamai 403) => quét kênh Telegram
+     chính thức @MEXC_OfficialAnnouncements (link từ trang MEXC), lọc theo hashtag.
+7. Cơ chế hoạt động:
+   - Lưu vết bài viết bằng SQLite (không cần cài đặt server DB, tự sinh file .db)
+   - Lần đầu chạy: Tự động ghi nhớ các bài hiện có làm mốc, KHÔNG bị spam tin cũ
+   - Khi có bài mới: Bắn thông báo Telegram tức thì (Định dạng HTML đẹp mắt)
+   - Tự động phục hồi khi mất mạng, xử lý tín hiệu dừng an toàn (Graceful Shutdown)
 =============================================================================
 """
 
-import asyncio
-import csv
-from datetime import datetime
-import html
-import io
-import json
+from __future__ import annotations
+
 import os
-import re
 import sys
 import time
-from urllib.parse import urlsplit, urlunsplit
-
+import json
+import html
+import re
+import signal
+import sqlite3
+import asyncio
+import requests
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from huggingface_hub import InferenceClient
-from PIL import Image, ImageOps
-try:
-  from json_repair import repair_json
-except ImportError:
-  def repair_json(text: str) -> str:
-    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    return cleaned
-from playwright.async_api import async_playwright
-from pydantic import BaseModel
-import requests
+from typing import Optional, Union, List, Dict, Tuple
 
 # =====================================================================
-# ⚙️ 1. NẠP BIẾN MÔI TRƯỜNG & CẤU HÌNH HỆ THỐNG
+# ⚙️ 1. CẤU HÌNH HỆ THỐNG & NẠP BIẾN MÔI TRƯỜNG
 # =====================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Nạp các file .env
-load_dotenv(os.path.join(BASE_DIR, "key.env"))
+# Ưu tiên đọc cấu hình từ file tk_key.env và key.env trong cùng thư mục
 load_dotenv(os.path.join(BASE_DIR, "tk_key.env"))
+load_dotenv(os.path.join(BASE_DIR, "key.env"))
 
-GEMINI_KEY = os.getenv("gemini_api_key") or os.getenv("gemini_api_key_2")
-# Toàn bộ key Gemini khả dụng (đã loại trùng) để xoay vòng khi key chính lỗi/hết quota
-GEMINI_KEYS = list(dict.fromkeys(
-    k.strip() for k in (
-        os.getenv("gemini_api_key"),
-        os.getenv("gemini_api_key_2"),
-        os.getenv("gemini_api_key_3"),
-    ) if k and k.strip()
-))
-# Danh sách model dự phòng (thử lần lượt sau model chính)
-GEMINI_FALLBACK_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-2.5-flash",
-]
-HF_KEY = os.getenv("hf_api")
-
-def _env(*names: str, default: str = "") -> str:
-  """Đọc biến môi trường, chấp nhận cả tên viết thường lẫn VIẾT HOA (tk_key.env dùng cả 2 kiểu)."""
-  for n in names:
-    v = os.getenv(n) or os.getenv(n.upper()) or os.getenv(n.lower())
-    if v:
-      return v.strip()
-  return default
-
-
-CP_WP_USER = _env("cp_wp_user", default="trungnn")
-CP_WP_PASSWORD = _env("cp_wp_password", default="hO3teW@smHd&uoPj52o4@Qru")
-
-VB_WP_USER = _env("vb_wp_user", default="trungnn41299@gmail.com")
-VB_WP_PASSWORD = _env("vb_wp_password", default="$7RloCF&%vdbpV&e")
-
+# Token bot và Chat ID Telegram (lấy cùng cấu hình với auto_telegram_wp_bot)
 TELEGRAM_BOT_TOKEN = (
     os.getenv("news_bot_token")
     or os.getenv("trading_bot_token")
 )
-TELEGRAM_CHAT_ID = os.getenv("tk_news_chatid", "-1004422031564")
+TELEGRAM_CHAT_ID = os.getenv("tk_news_personal_chatid", "-1004422031564")
+
+CONFIG = {
+    # Đường dẫn file database SQLite (Tự động tạo ngay tại thư mục hiện tại)
+    "DB_PATH": os.path.join(BASE_DIR, "seen_articles.db"),
+    
+    # Cấu hình Telegram
+    "TELEGRAM": {
+        "BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "CHAT_ID": TELEGRAM_CHAT_ID,
+        "TIMEOUT": 15,
+        # Định tuyến Topic (message_thread_id) theo nguồn tin.
+        # Nguồn không có trong bảng -> gửi vào General (không kèm thread).
+        "THREAD_ROUTING": {
+            # Sàn giao dịch
+            "BINANCE": 2042,
+            "OKX": 2042,
+            "MEXC": 2042,
+            # Beebom
+            "BEEBOM": 2045,
+            # Gọi vốn / Fundraising
+            "DEALROOM": 2041,
+            "TECHCRUNCH": 2041,
+            "CRYPTORANK": 2041,
+            "BIZZTOR": 2041,
+        },
+    },
+    
+    # Cấu hình gom tin theo đợt (Batching) - Ngăn ngừa spam tin nhắn khi nguồn có nhiều bài cùng lúc
+    "BATCH_MODE": True,
+    "BATCH_MAX_ITEMS": 15,
+
+    # Cấu hình nguồn Binance Announcements
+    "BINANCE": {
+        "ENABLE": True,
+        # 49: Tin tức chung/Listing, 93: Sự kiện/Airdrop/Giải đấu
+        "CATALOGS": [
+            {"id": 49, "name": "Binance News"},
+            {"id": 93, "name": "Binance Activities"},
+        ],
+        "BASE_URL": "https://www.binance.com/en/support/announcement",
+        "POLL_INTERVAL_SECONDS": 45,  # Quét mỗi 45 giây
+    },
+
+    # Cấu hình nguồn OKX Announcements (REST API công khai chính thức /api/v5/support)
+    "OKX": {
+        "ENABLE": True,
+        # Không truyền annType => lấy toàn bộ mục "Thông báo mới nhất" (giống trang
+        # https://www.okx.com/vi/help/section/announcements-latest-announcements)
+        "API_URL": "https://www.okx.com/api/v5/support/announcements",
+        "LANGUAGE": "vi-VN",  # Tiêu đề tiếng Việt; đổi "en-US" để lấy tiếng Anh
+        "POLL_INTERVAL_SECONDS": 120,  # Quét mỗi 2 phút
+        "TIMEOUT": 15,
+    },
+
+    # Cấu hình nguồn MEXC qua kênh Telegram thông báo chính thức (mexc.com chặn bot 403)
+    "MEXC": {
+        "ENABLE": True,
+        "CHANNEL": "MEXC_OfficialAnnouncements",
+        "WEB_URL": "https://t.me/s/MEXC_OfficialAnnouncements",
+        "LOG_NAME": "MEXC",
+        # Chỉ gửi tin có hashtag trong danh sách (kênh đăng ~20 tin/ngày, phần lớn là
+        # #Trading_Updates chỉnh phí/đòn bẩy). Các tag hiện có: Latest_Events, New_Listings,
+        # Delistings, 0_Fees, Trading_Updates, Maintenance_Updates, Product_Updates, MEXC_News.
+        # Để danh sách rỗng [] nếu muốn nhận TẤT CẢ.
+        "INCLUDE_TAGS": ["Latest_Events", "0_Fees"],
+        "POLL_INTERVAL_SECONDS": 300,  # Quét mỗi 5 phút
+    },
+    
+    # Cấu hình nguồn Dealroom.co
+    "DEALROOM": {
+        # ⛔ TẠM TẮT từ 2026-10-15: dealroom.co bật Cloudflare Managed Challenge
+        # (HTTP 403 "Just a moment...") chặn mọi HTTP client (requests, curl_cffi,
+        # Playwright headless) => không fetch được. Giữ scanner để tái bật khi có
+        # giải pháp vượt CF (stealth browser / scraper API trả phí).
+        "ENABLE": False,
+        # funding: Vòng gọi vốn, ipo: Niêm yết cổ phiếu
+        "LENSES": [
+            {"lens": "funding", "name": "Vòng Gọi Vốn (Funding)"},
+            {"lens": "ipo", "name": "Kế Hoạch IPO / Listing"},
+        ],
+        "BASE_URL": "https://dealroom.co/news",
+        "POLL_INTERVAL_SECONDS": 120,  # Quét mỗi 2 phút (tránh rate limit)
+    },
+
+    # Cấu hình nguồn Telegram Channel @cryptorank_fundraising (thay thế tin vòng gọi vốn)
+    "CRYPTORANK": {
+        "ENABLE": True,
+        # Username kênh (không có @): dùng cho cả web preview và link tin gốc
+        "CHANNEL": "cryptorank_fundraising",
+        "WEB_URL": "https://t.me/s/cryptorank_fundraising",
+        "POLL_INTERVAL_SECONDS": 300,  # Quét mỗi 5 phút (kênh chỉ đăng vài tin/ngày)
+    },
+
+    # Cấu hình nguồn TechCrunch Fundraising (WP-JSON API, thay thế vai trò Dealroom)
+    "TECHCRUNCH": {
+        "ENABLE": True,
+        "CATEGORY_NAME": "Fundraising",
+        # id category fundraising của TechCrunch (tra cứu qua /wp-json/wp/v2/categories)
+        "CATEGORY_ID": 577234943,
+        "API_URL": (
+            "https://techcrunch.com/wp-json/wp/v2/posts?categories=577234943"
+            "&per_page=15&_fields=id,slug,link,title,date,excerpt"
+        ),
+        "PAGE_URL": "https://techcrunch.com/category/fundraising/",
+        # Chỉ nhận bài có tiêu đề khớp ít nhất 1 từ khóa (regex word-boundary, không
+        # phân biệt hoa thường) để loại bài sự kiện/quảng cáo lẫn trong category.
+        "TITLE_KEYWORDS": [
+            "raise", "funding", "fundrais", "seed", "series", "round", "ipo",
+            "valuation", "bankrupt", "acquir", "shut down", "shuts down", "merger",
+        ],
+        "POLL_INTERVAL_SECONDS": 300,  # Quét mỗi 5 phút
+    },
+
+    # Cấu hình nguồn Beebom (Roblox Codes)
+    "BEEBOM": {
+        "ENABLE": True,
+        "TAG_NAME": "Roblox Codes",
+        "TAG_URL": "https://beebom.com/tag/roblox-codes/",
+        "API_URL": "https://beebom.com/wp-json/wp/v2/posts?tags=253215&per_page=15",
+        "POLL_INTERVAL_SECONDS": 180,  # Quét mỗi 3 phút
+    },
+
+    # Cấu hình nguồn Bizztor Startup & VC News (https://bizztor.com/news/)
+    "BIZZTOR": {
+        "ENABLE": True,
+        "BASE_URL": "https://bizztor.com/news/",
+        "POLL_INTERVAL_SECONDS": 300,  # Quét mỗi 5 phút
+        "TIMEOUT": 15,
+    },
+}
+
+# Biến cờ kiểm soát vòng lặp chạy ngầm (hỗ trợ tắt an toàn)
+IS_RUNNING = True
 
 
-def get_platform_config(platform: str = "VB") -> dict:
-  """Tạo dictionary cấu hình đồng bộ cho từng nền tảng (VB hoặc CP)."""
-  p = platform.upper()
-  is_vb = p == "VB"
-
-  logo_file = "VB_white_logo.png" if is_vb else "CP_white_logo.png"
-  logo_path = os.path.join(BASE_DIR, logo_file)
-  if not os.path.exists(logo_path):
-    # Thử tìm ở thư mục cha hoặc tk_bot nếu đang chạy trong for_agent
-    alt_path = os.path.join(os.path.dirname(BASE_DIR), "tk_bot", logo_file)
-    if os.path.exists(alt_path):
-      logo_path = alt_path
-
-  return {
-      "PLATFORM": p,
-      # 1. AI Models & Threshold
-      "GEMINI_API_KEY": GEMINI_KEY,
-      "MODELS": {
-          "MAIN_AI": "gemini-3.5-flash-lite",
-          "CHECK_AI": "gemini-3.5-flash-lite",
-          "REWRITE_AI": "gemini-3.5-flash-lite",
-      },
-      "AI_THRESHOLD": 35,
-      # 2. Tạo ảnh Hugging Face (Bộ màu thương hiệu & Logo)
-      "IMAGE": {
-          "ENABLE_GENERATION": True,
-          "PLATFORM": p,
-          "HF_API_TOKEN": HF_KEY,
-          "HF_MODEL_ID": "krea/Krea-2-Turbo",
-          "OUTPUT_DIR": os.path.join(BASE_DIR, "downloads"),
-          "LOGO_PATH": logo_path,
-      },
-      # 3. Cấu hình WordPress
-      "WORDPRESS": {
-          "PLATFORM": p,
-          "SITE_URL": "https://ventureburn.com" if is_vb else "https://chainplay.gg",
-          "LOGIN_URL": "https://ventureburn.com/tklogin/" if is_vb else "https://chainplay.gg/tklogin/",
-          "USERNAME": VB_WP_USER if is_vb else CP_WP_USER,
-          "PASSWORD": VB_WP_PASSWORD if is_vb else CP_WP_PASSWORD,
-          "PROFILE_DIR": os.path.join(BASE_DIR, "wp_profile_vb" if is_vb else "wp_profile"),
-          "HEADLESS": True,
-      },
-      # 4. Quản lý File CSV
-      "CSV_LOG_PATH": os.path.join(BASE_DIR, "vb_articles_log.csv" if is_vb else "cp_articles_log.csv"),
-      # 5. Cấu hình Telegram Notification
-      "TELEGRAM_NOTIFY": {
-          "ENABLE": True,
-          "BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-          "CHAT_ID": TELEGRAM_CHAT_ID,
-          "BRAND_NAME": "VENTUREBURN BOT" if is_vb else "CHAINPLAY BOT",
-      },
-      # 6. Cấu hình Quét Binance Announcements
-      "BINANCE": {
-          "CATALOG_IDS": [93, 49, 48],
-          "LANG": "en",
-          "BASE_ANNOUNCEMENT_URL": "https://www.binance.com/en/support/announcement",
-          "KEYWORD_WHITELIST": [
-              "List",
-              "Listing",
-              "Binance Will List",
-              "Tournament",
-              "Trading Tournament",
-              "Airdrop",
-              "Introduce",
-              "Introduces",
-              "Introducing",
-              "Trading Festival",
-              "Festival",
-              "Competition",
-              "Compete",
-              "Rewards",
-              "Prize",
-              "Will Feature",
-              "Feature",
-              "Launch",
-              "Launches",
-              "Launching",
-          ],
-          "KEYWORD_BLACKLIST": [
-              "Prediction Market",
-          ],
-          "POLL_INTERVAL_SECONDS": 600,
-      },
-  }
+def handle_shutdown_signal(sig, frame):
+    """Bắt tín hiệu Ctrl+C hoặc kill để dừng bot an toàn, giải phóng tài nguyên."""
+    global IS_RUNNING
+    print(f"\n🛑 Nhận tín hiệu dừng ({sig}). Đang hoàn tất công việc và thoát an toàn...")
+    IS_RUNNING = False
 
 
-CONFIG_VB = get_platform_config("VB")
-CONFIG_CP = get_platform_config("CP")
-CONFIG = CONFIG_VB  # Mặc định cấu hình Ventureburn (VB)
+signal.signal(signal.SIGINT, handle_shutdown_signal)
+signal.signal(signal.SIGTERM, handle_shutdown_signal)
 
 
 # =====================================================================
-# 🛟 GEMINI FALLBACK CLIENT (XOAY VÒNG KEY + MODEL DỰ PHÒNG)
+# 🗄️ 2. LỚP LƯU TRỮ TRẠNG THÁI BẰNG SQLITE (ZERO-CONFIG)
 # =====================================================================
-class GeminiAllFailedError(RuntimeError):
-  """Tất cả tổ hợp (model, key) đều lỗi."""
-
-
-class GeminiFallbackClient:
-  """Gọi Gemini với cơ chế fallback.
-
-  Thứ tự thử: với từng model (model chính trước, sau đó các model dự phòng),
-  thử lần lượt từng API key. Phân loại lỗi:
-    - 429 (hết quota/rate limit), 401/403 (key hỏng)  ➔ chuyển sang key kế tiếp.
-    - 404 / 400 do model không tồn tại/không hỗ trợ   ➔ bỏ qua model này.
-    - 5xx, timeout, lỗi mạng                           ➔ retry có backoff, rồi chuyển tiếp.
-    - Response rỗng hoặc validate() thất bại          ➔ chuyển tổ hợp kế tiếp.
-  """
-
-  def __init__(
-      self,
-      api_key: str | None = None,
-      model_id: str | None = None,
-      fallback_models: list[str] | None = None,
-      api_keys: list[str] | None = None,
-      retries_per_combo: int = 2,
-      base_delay: float = 2.0,
-      timeout_ms: int = 120_000,
-  ):
-    keys = [api_key] + list(api_keys if api_keys is not None else GEMINI_KEYS)
-    self.api_keys = list(dict.fromkeys(k for k in keys if k))
-    if not self.api_keys:
-      raise ValueError("Không tìm thấy Gemini API key nào (gemini_api_key*).")
-
-    models = [model_id] + list(
-        fallback_models if fallback_models is not None else GEMINI_FALLBACK_MODELS
-    )
-    self.models = list(dict.fromkeys(m for m in models if m))
-    self.retries_per_combo = max(1, retries_per_combo)
-    self.base_delay = base_delay
-    self.timeout_ms = timeout_ms
-    self._clients: dict[str, genai.Client] = {}
-    self.last_model_used: str | None = None
-
-  def _client(self, key: str) -> genai.Client:
-    if key not in self._clients:
-      self._clients[key] = genai.Client(
-          api_key=key, http_options=types.HttpOptions(timeout=self.timeout_ms)
-      )
-    return self._clients[key]
-
-  @staticmethod
-  def _classify(err: Exception) -> str:
-    code = getattr(err, "code", None)
-    msg = str(err).lower()
-    if code == 429 or "resource_exhausted" in msg or "quota" in msg:
-      return "next_key"
-    if code in (401, 403) or "api key" in msg or "permission" in msg:
-      return "next_key"
-    if code == 404 or (code == 400 and ("model" in msg or "not supported" in msg)):
-      return "next_model"
-    if isinstance(code, int) and 400 <= code < 500:
-      # Lỗi request khác (prompt/config) — thử model khác có thể vẫn chạy được
-      return "next_model"
-    return "retry"  # 5xx, timeout, lỗi mạng, lỗi không xác định
-
-  @staticmethod
-  def _mask(key: str) -> str:
-    return f"...{key[-4:]}" if len(key) > 4 else "***"
-
-  def generate(self, contents, config=None, validate=None, label: str = "Gemini"):
-    """Trả về (response, result) — result là output của validate(response) nếu có.
-
-    validate(response) nên raise Exception khi output không dùng được
-    (ví dụ JSON hỏng) để kích hoạt fallback sang tổ hợp kế tiếp.
+class StorageManager:
     """
-    errors_log: list[str] = []
-    for model in self.models:
-      skip_model = False
-      for key in self.api_keys:
-        for attempt in range(1, self.retries_per_combo + 1):
-          try:
-            resp = self._client(key).models.generate_content(
-                model=model, contents=contents, config=config
+    Quản lý lưu vết các bài viết đã thông báo.
+    Sử dụng SQLite tích hợp sẵn trong Python:
+    - Không cần cài MySQL hay Redis
+    - Tự sinh file seen_articles.db
+    - Đảm bảo khởi động lại server không bao giờ bị bắn trùng bài cũ.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _get_connection(self):
+        return sqlite3.connect(self.db_path, timeout=10)
+
+    def _init_db(self):
+        """Tạo bảng lưu trữ nếu chưa có."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seen_articles (
+                    source TEXT NOT NULL,
+                    article_id TEXT NOT NULL,
+                    catalog_or_lens TEXT,
+                    title TEXT,
+                    url TEXT,
+                    amount TEXT,
+                    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (source, article_id)
+                )
+                """
             )
-            text = getattr(resp, "text", None)
-            if not text or not text.strip():
-              finish = None
-              try:
-                finish = resp.candidates[0].finish_reason
-              except Exception:
-                pass
-              raise ValueError(f"Response rỗng (finish_reason={finish})")
-            result = validate(resp) if validate else None
-            if model != self.models[0] or key != self.api_keys[0]:
-              print(f"🛟 [{label}] Fallback thành công: model={model}, key={self._mask(key)}")
-            self.last_model_used = model
-            return resp, result
-          except Exception as e:
-            action = self._classify(e)
-            short = str(e).replace("\n", " ")[:200]
-            errors_log.append(f"{model}/{self._mask(key)}#{attempt}: {short}")
-            print(
-                f"⚠️ [{label}] Lỗi model={model} key={self._mask(key)}"
-                f" (lần {attempt}/{self.retries_per_combo}) ➔ {action}: {short}"
+            conn.commit()
+
+    def is_seen(self, source: str, article_id: str) -> bool:
+        """Kiểm tra xem mã bài viết này đã từng được lưu hay chưa."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM seen_articles WHERE source = ? AND article_id = ?",
+                (source, str(article_id)),
             )
-            if action == "next_model":
-              skip_model = True
-              break
-            if action == "next_key":
-              break
-            if attempt < self.retries_per_combo:
-              time.sleep(self.base_delay * (2 ** (attempt - 1)))
-        if skip_model:
-          break
-    raise GeminiAllFailedError(
-        f"[{label}] Tất cả {len(self.models)} model x {len(self.api_keys)} key"
-        f" đều thất bại. Lỗi cuối: {errors_log[-3:]}"
-    )
+            return cursor.fetchone() is not None
 
+    def mark_seen(
+        self,
+        source: str,
+        article_id: str,
+        catalog_or_lens: str = "",
+        title: str = "",
+        url: str = "",
+        amount: str = "",
+    ):
+        """Ghi nhận mã bài viết vào database."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO seen_articles 
+                (source, article_id, catalog_or_lens, title, url, amount, detected_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source,
+                    str(article_id),
+                    catalog_or_lens,
+                    title,
+                    url,
+                    amount,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            conn.commit()
 
-
-# =====================================================================
-# 📦 HELPER: XỬ LÝ ẢNH CỤC BỘ & METADATA
-# =====================================================================
-class ImageHelper:
-
-  @staticmethod
-  def download_and_sanitize_image(
-      image_url: str, slug: str, output_dir: str, index: int = 1
-  ) -> str | None:
-    """Tải ảnh về máy, xóa EXIF/Metadata và đổi tên file theo slug."""
-    try:
-      headers = {
-          "User-Agent": (
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-              " (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-          )
-      }
-      resp = requests.get(image_url, headers=headers, timeout=20)
-      if resp.status_code != 200:
-        return None
-
-      clean_slug = re.sub(r"[^a-zA-Z0-9_-]", "", slug.replace(" ", "-"))[:40]
-      filename = f"{clean_slug}-img-{index}-{int(time.time())}.jpg"
-      file_path = os.path.join(output_dir, filename)
-
-      image = Image.open(io.BytesIO(resp.content)).convert("RGB")
-      image.save(file_path, "JPEG", quality=90, optimize=True)
-      return file_path
-    except Exception as e:
-      print(f"⚠️ Lỗi khi tải/xử lý ảnh ({image_url}): {e}")
-      return None
+    def count_seen(self, source: str = None) -> int:
+        """Đếm số bài viết đã ghi nhớ."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if source:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM seen_articles WHERE source = ?", (source,)
+                )
+            else:
+                cursor.execute("SELECT COUNT(*) FROM seen_articles")
+            row = cursor.fetchone()
+            return row[0] if row else 0
 
 
 # =====================================================================
-# 📦 MODULE 1: BINANCE SCANNER & EXTRACTOR
+# 📢 3. LỚP GỬI THÔNG BÁO QUA TELEGRAM BOT
+# =====================================================================
+class TelegramAlertService:
+    """Đảm nhiệm việc gửi tin nhắn cảnh báo có định dạng HTML tới Telegram."""
+
+    def __init__(self, config: dict):
+        self.bot_token = config.get("BOT_TOKEN")
+        self.chat_id = config.get("CHAT_ID")
+        self.timeout = config.get("TIMEOUT", 15)
+        self.thread_routing = {
+            str(k).upper(): v for k, v in config.get("THREAD_ROUTING", {}).items()
+        }
+
+    def thread_for(self, source: str = None):
+        """Trả về message_thread_id của nguồn tin (None = gửi vào General)."""
+        return self.thread_routing.get(str(source or "").upper())
+
+    def send_message(self, html_text: str, source: str = None) -> bool:
+        """Gửi tin nhắn định dạng HTML qua Telegram Bot API, vào đúng Topic theo nguồn."""
+        if not self.bot_token or not self.chat_id:
+            print("⚠️ Chưa cấu hình Telegram Bot Token hoặc Chat ID.")
+            return False
+
+        api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": html_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        }
+        thread_id = self.thread_for(source)
+        if thread_id is not None:
+            payload["message_thread_id"] = int(thread_id)
+
+        try:
+            resp = requests.post(api_url, json=payload, timeout=self.timeout)
+            if resp.status_code == 200:
+                return True
+            else:
+                print(f"⚠️ Gửi Telegram thất bại (HTTP {resp.status_code}): {resp.text}")
+                return False
+        except Exception as e:
+            print(f"⚠️ Lỗi kết nối Telegram: {e}")
+            return False
+
+    def notify_binance_article(self, article: dict):
+        """Format và gửi tin tức Binance."""
+        catalog_name = article.get("catalog_name", "Binance Update")
+        catalog_id = article.get("catalog_id", 0)
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        release_date = article.get("release_date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        badge = "🚨 <b>[BINANCE NEWS]</b>" if catalog_id == 49 else "🎁 <b>[BINANCE ACTIVITIES & REWARDS]</b>"
+
+        msg = (
+            f"{badge}\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}\n"
+            f"📂 <b>Chuyên mục:</b> {catalog_name} (Catalog #{catalog_id})\n"
+            f"⏰ <b>Thời gian:</b> {release_date} (UTC+7)\n"
+            f"🔗 <b>Link Binance:</b> <a href='{url}'>Xem thông báo gốc trên Binance</a>\n\n"
+            f"🏷️ <i>#Binance #CryptoNews #{catalog_name.replace(' ', '')}</i>"
+        )
+        success = self.send_message(msg, source="BINANCE")
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo Binance: {title[:50]}...")
+        return success
+
+    def notify_dealroom_deal(self, deal: dict):
+        """Format và gửi tin tức vòng gọi vốn / IPO từ Dealroom."""
+        lens = deal.get("lens", "news")
+        lens_name = deal.get("lens_name", "Dealroom Intelligence")
+        title = html.escape(deal.get("title", "No Title"))
+        url = deal.get("url", "")
+        amount_fmt = deal.get("amount_formatted", "N/A")
+        sector = deal.get("sector", "Technology")
+        geo = deal.get("geo", "Global")
+        date_str = deal.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        badge = "💰 <b>[DEALROOM - VÒNG GỌI VỐN MỚI]</b>" if lens == "funding" else "🏛️ <b>[DEALROOM - KẾ HOẠCH IPO / LISTING]</b>"
+
+        msg = (
+            f"{badge}\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}\n"
+            f"💵 <b>Quy mô Deal:</b> <b>{amount_fmt}</b>\n"
+            f"🏢 <b>Lĩnh vực:</b> {sector.title()}\n"
+            f"🌍 <b>Khu vực:</b> {geo.replace('-', ' ').title()}\n"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Xem chi tiết:</b> <a href='{url}'>Mở bài viết trên Dealroom</a>\n\n"
+            f"🏷️ <i>#Dealroom #{lens.upper()} #VentureCapital #StartupNews</i>"
+        )
+        success = self.send_message(msg, source="DEALROOM")
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo Dealroom: {title[:50]}...")
+        return success
+
+    def send_split_message(self, html_text: str, max_length: int = 3900, source: str = None) -> bool:
+        """Tự động chia nhỏ tin nhắn nếu vượt giới hạn Telegram (4096 ký tự)."""
+        if len(html_text) <= max_length:
+            return self.send_message(html_text, source=source)
+
+        blocks = html_text.split("\n\n")
+        chunks = []
+        current_chunk = []
+        current_len = 0
+
+        for block in blocks:
+            if current_len + len(block) + 2 > max_length and current_chunk:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = [block]
+                current_len = len(block)
+            else:
+                current_chunk.append(block)
+                current_len += len(block) + 2
+
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+
+        total = len(chunks)
+        all_success = True
+        for idx, chunk in enumerate(chunks, 1):
+            chunk_with_page = f"<i>(Phần {idx}/{total})</i>\n" + chunk if total > 1 else chunk
+            ok = self.send_message(chunk_with_page, source=source)
+            if not ok:
+                all_success = False
+            time.sleep(1)
+        return all_success
+
+    def notify_binance_batch(self, articles: list[dict]):
+        """Gom nhiều thông báo Binance vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return
+        if len(articles) == 1:
+            return self.notify_binance_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"🚨 <b>[BINANCE - TỔNG HỢP {count} THÔNG BÁO MỚI NHẤT]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            cat_id = art.get("catalog_id", 0)
+            cat_name = art.get("catalog_name", "Binance Update")
+            badge_icon = "📢" if cat_id == 49 else "🎁"
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            release_date = art.get("release_date_str", "")
+
+            item = (
+                f"<b>{i}️⃣ {badge_icon} [{cat_name}]</b>\n"
+                f"   📌 {title}\n"
+                f"   ⏰ {release_date} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Xem bài gốc trên Binance</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#Binance #BatchDigest #CryptoNews #MultiSourceRadar</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg, source="BINANCE")
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch Binance ({count} thông báo).")
+        return success
+
+    def notify_dealroom_batch(self, deals: list[dict]):
+        """Gom nhiều deal vòng gọi vốn & IPO từ Dealroom vào 1 tin nhắn tổng hợp."""
+        if not deals:
+            return
+        if len(deals) == 1:
+            return self.notify_dealroom_deal(deals[0])
+
+        count = len(deals)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"💰 <b>[DEALROOM - TỔNG HỢP {count} THƯƠNG VỤ MỚI NHẤT]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, deal in enumerate(deals, 1):
+            lens = deal.get("lens", "funding")
+            icon = "💵" if lens == "funding" else "🏛️"
+            lens_tag = "Funding" if lens == "funding" else "IPO/Listing"
+            title = html.escape(deal.get("title", "No Title"))
+            amt = deal.get("amount_formatted", "N/A")
+            sector = deal.get("sector", "Tech").title()
+            geo = deal.get("geo", "Global").replace("-", " ").title()
+            url = deal.get("url", "")
+
+            item = (
+                f"<b>{i}️⃣ {icon} [{lens_tag}] {title}</b>\n"
+                f"   💵 Quy mô: <b>{amt}</b> | 🏢 {sector} | 🌍 {geo}\n"
+                f"   🔗 <a href='{url}'>Xem chi tiết trên Dealroom</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#Dealroom #BatchDigest #VentureCapital #StartupNews #IPO</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg, source="DEALROOM")
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch Dealroom ({count} deals).")
+        return success
+
+    def notify_beebom_article(self, article: dict):
+        """Format và gửi tin tức lẻ Beebom Roblox Codes."""
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        date_str = article.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        msg = (
+            f"🎮 <b>[BEEBOM - ROBLOX CODES MỚI]</b>\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}\n"
+            f"📂 <b>Chuyên mục:</b> Roblox Codes / Game Codes\n"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Lấy mã Code:</b> <a href='{url}'>Xem bài hướng dẫn & nhận Giftcode</a>\n\n"
+            f"🏷️ <i>#Beebom #Roblox #RobloxCodes #Giftcode #GamingNews</i>"
+        )
+        success = self.send_message(msg, source="BEEBOM")
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo Beebom: {title[:50]}...")
+        return success
+
+    def notify_beebom_batch(self, articles: list[dict]):
+        """Gom nhiều bài Beebom Roblox Codes vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return
+        if len(articles) == 1:
+            return self.notify_beebom_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"🎮 <b>[BEEBOM - TỔNG HỢP {count} BÀI ROBLOX CODES MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            date_str = art.get("date_str", "")
+
+            item = (
+                f"<b>{i}️⃣ 🕹️ {title}</b>\n"
+                f"   ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Xem mã Giftcode trên Beebom</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#Beebom #BatchDigest #RobloxCodes #GamingNews</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg, source="BEEBOM")
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch Beebom ({count} bài).")
+        return success
+
+    def notify_cryptorank_article(self, item: dict) -> bool:
+        """Format và gửi 1 tin fundraising từ kênh Telegram CryptoRank."""
+        title = html.escape(item.get("title", "No Title"))
+        round_type = html.escape(item.get("round_type", "Fundraising"))
+        amount_fmt = html.escape(item.get("amount_formatted", "Không công bố"))
+        body = html.escape(item.get("full_text", ""))
+        url = item.get("url", "")
+        date_str = item.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        project_url = item.get("project_url", "")
+
+        project_link = ""
+        if project_url:
+            project_link = (
+                f"🔗 <b>Trang dự án:</b> <a href='{html.escape(project_url)}'>Mở trên CryptoRank.io</a>\n"
+            )
+
+        msg = (
+            f"💼 <b>[CRYPTORANK - FUNDRAISING MỚI]</b>\n\n"
+            f"📌 <b>Dự án:</b> {title}\n"
+            f"💰 <b>Vòng vốn:</b> {round_type} | <b>Quy mô:</b> <b>{amount_fmt}</b>\n"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"{project_link}"
+            f"📄 <b>Nội dung tin:</b>\n{body}\n"
+            f"🔗 <b>Tin gốc:</b> <a href='{url}'>Xem trên Telegram</a>\n\n"
+            f"🏷️ <i>#CryptoRank #Fundraising #VentureCapital #StartupNews</i>"
+        )
+        success = self.send_message(msg, source="CRYPTORANK")
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo CryptoRank: {title[:50]}...")
+        return success
+
+    def notify_cryptorank_batch(self, items: list[dict]) -> bool:
+        """Gom nhiều tin CryptoRank Fundraising vào 1 tin nhắn tổng hợp."""
+        if not items:
+            return True
+        if len(items) == 1:
+            return self.notify_cryptorank_article(items[0])
+
+        count = len(items)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"💼 <b>[CRYPTORANK - TỔNG HỢP {count} TIN FUNDRAISING MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, item in enumerate(items, 1):
+            title = html.escape(item.get("title", "No Title"))
+            round_type = html.escape(item.get("round_type", "Fundraising"))
+            amount_fmt = html.escape(item.get("amount_formatted", "Không công bố"))
+            url = item.get("url", "")
+            date_str = item.get("date_str", "")
+            project_url = item.get("project_url", "")
+
+            links = f"<a href='{url}'>Tin gốc</a>"
+            if project_url:
+                links += f" | <a href='{html.escape(project_url)}'>CryptoRank.io</a>"
+
+            item_text = (
+                f"<b>{i}️⃣ 💼 {title}</b>\n"
+                f"   💰 {round_type} | Quy mô: <b>{amount_fmt}</b>\n"
+                f"   ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 {links}"
+            )
+            items_text.append(item_text)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#CryptoRank #BatchDigest #Fundraising #VentureCapital</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg, source="CRYPTORANK")
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch CryptoRank ({count} tin).")
+        return success
+
+
+    def notify_techcrunch_article(self, article: dict) -> bool:
+        """Format và gửi 1 bài fundraising từ TechCrunch."""
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        date_str = article.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        excerpt = html.escape(article.get("excerpt", ""))
+
+        excerpt_block = f"📄 <i>{excerpt}</i>\n" if excerpt else ""
+
+        msg = (
+            f"📰 <b>[TECHCRUNCH - FUNDRAISING MỚI]</b>\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}\n"
+            f"{excerpt_block}"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Đọc bài gốc:</b> <a href='{url}'>Mở bài viết trên TechCrunch</a>\n\n"
+            f"🏷️ <i>#TechCrunch #Fundraising #VentureCapital #StartupNews</i>"
+        )
+        success = self.send_message(msg, source="TECHCRUNCH")
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo TechCrunch: {title[:50]}...")
+        return success
+
+    def notify_techcrunch_batch(self, articles: list[dict]) -> bool:
+        """Gom nhiều bài TechCrunch Fundraising vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return True
+        if len(articles) == 1:
+            return self.notify_techcrunch_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"📰 <b>[TECHCRUNCH - TỔNG HỢP {count} BÀI FUNDRAISING MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            date_str = art.get("date_str", "")
+
+            item = (
+                f"<b>{i}️⃣ 📰 {title}</b>\n"
+                f"   ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Đọc bài gốc trên TechCrunch</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#TechCrunch #BatchDigest #Fundraising #StartupNews</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg, source="TECHCRUNCH")
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch TechCrunch ({count} bài).")
+        return success
+
+    def notify_bizztor_article(self, article: dict) -> bool:
+        """Format và gửi tin tức gọi vốn / Startup từ Bizztor."""
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        amount = article.get("amount_formatted", "Không công bố")
+        round_type = article.get("round_type", "Fundraising")
+        excerpt = html.escape(article.get("excerpt", ""))
+        date_str = article.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        badge = "💰 <b>[BIZZTOR - STARTUP & VC FUNDING]</b>"
+        detail_lines = []
+        if amount and amount != "Không công bố":
+            detail_lines.append(f"💵 <b>Quy mô Deal:</b> <b>{amount}</b>")
+        if round_type and round_type != "Fundraising":
+            detail_lines.append(f"🎯 <b>Vòng gọi vốn:</b> {round_type}")
+
+        details_str = ("\n" + "\n".join(detail_lines)) if detail_lines else ""
+        excerpt_block = f"\n📝 <i>{excerpt[:200]}...</i>\n" if excerpt else "\n"
+
+        msg = (
+            f"{badge}\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}"
+            f"{details_str}\n"
+            f"{excerpt_block}"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Xem chi tiết:</b> <a href='{url}'>Mở bài viết trên Bizztor</a>\n\n"
+            f"🏷️ <i>#Bizztor #StartupFunding #VentureCapital #AI #TechNews</i>"
+        )
+        success = self.send_message(msg, source="BIZZTOR")
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo Bizztor: {title[:50]}...")
+        return success
+
+    def notify_bizztor_batch(self, articles: list[dict]) -> bool:
+        """Gom nhiều bài Bizztor vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return True
+        if len(articles) == 1:
+            return self.notify_bizztor_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"💼 <b>[BIZZTOR - TỔNG HỢP {count} TIN FUNDRAISING MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            amount = art.get("amount_formatted", "")
+            round_type = art.get("round_type", "")
+            date_str = art.get("date_str", "")
+
+            deal_tag = ""
+            if amount and amount != "Không công bố":
+                deal_tag = f" | 💵 {amount}"
+                if round_type and round_type != "Fundraising":
+                    deal_tag += f" ({round_type})"
+
+            item = (
+                f"<b>{i}️⃣ 🚀 {title}</b>{deal_tag}\n"
+                f"   ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Đọc bài gốc trên Bizztor</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#Bizztor #BatchDigest #VentureCapital #StartupNews</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg, source="BIZZTOR")
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch Bizztor ({count} bài).")
+        return success
+
+    def notify_okx_article(self, article: dict) -> bool:
+        """Format và gửi thông báo OKX."""
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        type_name = html.escape(article.get("type_name", "Thông báo"))
+        date_str = article.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        msg = (
+            f"⚫ <b>[OKX ANNOUNCEMENT]</b>\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}\n"
+            f"📂 <b>Chuyên mục:</b> {type_name}\n"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Link OKX:</b> <a href='{url}'>Xem thông báo gốc trên OKX</a>\n\n"
+            f"🏷️ <i>#OKX #CryptoNews</i>"
+        )
+        success = self.send_message(msg, source="OKX")
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo OKX: {title[:50]}...")
+        return success
+
+    def notify_okx_batch(self, articles: list[dict]) -> bool:
+        """Gom nhiều thông báo OKX vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return True
+        if len(articles) == 1:
+            return self.notify_okx_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"⚫ <b>[OKX - TỔNG HỢP {count} THÔNG BÁO MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            type_name = html.escape(art.get("type_name", ""))
+            date_str = art.get("date_str", "")
+
+            item = (
+                f"<b>{i}️⃣ 📢 {title}</b>\n"
+                f"   📂 {type_name} | ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Xem thông báo gốc trên OKX</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#OKX #BatchDigest #CryptoNews</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg, source="OKX")
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch OKX ({count} thông báo).")
+        return success
+
+    def notify_mexc_article(self, article: dict) -> bool:
+        """Format và gửi thông báo MEXC."""
+        title = html.escape(article.get("title", "No Title"))
+        url = article.get("url", "")
+        category = html.escape(article.get("category", "Announcement"))
+        date_str = article.get("date_str", datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        msg = (
+            f"🔵 <b>[MEXC ANNOUNCEMENT]</b>\n\n"
+            f"📌 <b>Tiêu đề:</b> {title}\n"
+            f"📂 <b>Chuyên mục:</b> {category}\n"
+            f"⏰ <b>Thời gian:</b> {date_str} (UTC+7)\n"
+            f"🔗 <b>Link MEXC:</b> <a href='{url}'>Xem thông báo gốc trên MEXC</a>\n\n"
+            f"🏷️ <i>#MEXC #CryptoNews</i>"
+        )
+        success = self.send_message(msg, source="MEXC")
+        if success:
+            print(f"✅ [Telegram] Đã bắn thông báo MEXC: {title[:50]}...")
+        return success
+
+    def notify_mexc_batch(self, articles: list[dict]) -> bool:
+        """Gom nhiều thông báo MEXC vào 1 tin nhắn tổng hợp."""
+        if not articles:
+            return True
+        if len(articles) == 1:
+            return self.notify_mexc_article(articles[0])
+
+        count = len(articles)
+        now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+        header = (
+            f"🔵 <b>[MEXC - TỔNG HỢP {count} THÔNG BÁO MỚI]</b>\n"
+            f"⏰ <i>Thời gian quét: {now_str} (UTC+7)</i>\n"
+            f"──────────────────────────\n\n"
+        )
+
+        items_text = []
+        for i, art in enumerate(articles, 1):
+            title = html.escape(art.get("title", "No Title"))
+            url = art.get("url", "")
+            category = html.escape(art.get("category", ""))
+            date_str = art.get("date_str", "")
+
+            item = (
+                f"<b>{i}️⃣ 📢 {title}</b>\n"
+                f"   📂 {category} | ⏰ {date_str} (UTC+7)\n"
+                f"   🔗 <a href='{url}'>Xem thông báo gốc trên MEXC</a>"
+            )
+            items_text.append(item)
+
+        footer = "\n\n──────────────────────────\n🏷️ <i>#MEXC #BatchDigest #CryptoNews</i>"
+        full_msg = header + "\n\n".join(items_text) + footer
+        success = self.send_split_message(full_msg, source="MEXC")
+        if success:
+            print(f"✅ [Telegram] Đã bắn Batch MEXC ({count} thông báo).")
+        return success
+
+
+# =====================================================================
+# 🔍 4. BỘ QUÉT NGUỒN BINANCE ANNOUNCEMENTS
 # =====================================================================
 class BinanceScanner:
-  """Quét danh sách thông báo chính thức từ Binance API và bóc tách nội dung chi tiết."""
+    """Truy vấn trực tiếp REST API thông báo chính thức của Binance."""
 
-  def __init__(self, config: dict):
-    self.catalog_ids = config.get("CATALOG_IDS", [93, 49, 48])
-    self.lang = config.get("LANG", "en")
-    self.base_url = config.get(
-        "BASE_ANNOUNCEMENT_URL",
-        "https://www.binance.com/en/support/announcement",
-    )
-    self.headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            " (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ),
-        "lang": self.lang,
-        "clienttype": "web",
-    }
+    def __init__(self, config: dict):
+        self.catalogs = config.get("CATALOGS", [])
+        self.base_url = config.get("BASE_URL", "https://www.binance.com/en/support/announcement")
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "lang": "en",
+            "clienttype": "web",
+        }
 
-  def get_latest_articles(self) -> list[dict]:
-    """Quét tất cả các danh mục được chỉ định và trả về danh sách bài viết mới nhất."""
-    all_articles = []
-    seen_codes = set()
+    def fetch_latest_articles(self) -> list[dict]:
+        """Lấy danh sách các bài viết mới nhất từ các danh mục Catalog đã cấu hình."""
+        all_articles = []
+        for cat in self.catalogs:
+            cat_id = cat["id"]
+            cat_name = cat["name"]
+            url = f"https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId={cat_id}&pageNo=1&pageSize=10"
+            try:
+                resp = requests.get(url, headers=self.headers, timeout=12)
+                if resp.status_code != 200:
+                    print(f"⚠️ Binance API Catalog {cat_id} HTTP {resp.status_code}")
+                    continue
 
-    for cat_id in self.catalog_ids:
-      try:
-        url = f"https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId={cat_id}&pageNo=1&pageSize=15"
-        resp = requests.get(url, headers=self.headers, timeout=15)
-        if resp.status_code != 200:
-          print(f"⚠️ Binance API Catalog {cat_id} HTTP: {resp.status_code}")
-          continue
+                res_data = resp.json().get("data", {})
+                articles = []
+                # Dữ liệu của Binance có thể nằm ở data['articles'] hoặc data['catalogs'][0]['articles']
+                if res_data.get("articles"):
+                    articles.extend(res_data.get("articles", []))
+                for sub_cat in res_data.get("catalogs", []):
+                    articles.extend(sub_cat.get("articles", []))
 
-        res_data = resp.json().get("data", {})
-        cat_articles = res_data.get("articles", [])
-        for sub_cat in res_data.get("catalogs", []):
-          cat_articles.extend(sub_cat.get("articles", []))
+                for art in articles:
+                    code = art.get("code")
+                    if not code:
+                        continue
 
-        for art in cat_articles:
-          code = art.get("code")
-          if not code or code in seen_codes:
-            continue
-          seen_codes.add(code)
+                    title = art.get("title", "").strip()
+                    rel_date = art.get("releaseDate")
+                    date_str = ""
+                    if rel_date:
+                        try:
+                            # releaseDate là millisecond timestamp
+                            dt = datetime.fromtimestamp(int(rel_date) / 1000)
+                            date_str = dt.strftime("%Y-%m-%d %H:%M")
+                        except Exception:
+                            date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-          title = art.get("title", "").strip()
-          release_date = art.get("releaseDate")
-          article_url = f"{self.base_url}/{code}"
+                    article_url = f"{self.base_url}/{code}"
+                    all_articles.append({
+                        "source": "BINANCE",
+                        "article_id": code,
+                        "catalog_id": cat_id,
+                        "catalog_name": cat_name,
+                        "title": title,
+                        "url": article_url,
+                        "release_date_str": date_str,
+                    })
+            except Exception as e:
+                print(f"⚠️ Lỗi quét Binance Catalog {cat_id}: {e}")
 
-          all_articles.append({
-              "code": code,
-              "title": title,
-              "catalog_id": cat_id,
-              "release_date": release_date,
-              "url": article_url,
-          })
-      except Exception as e:
-        print(f"⚠️ Lỗi khi quét Catalog {cat_id}: {e}")
+        return all_articles
 
-    return all_articles
 
-  def _parse_binance_ast_node(self, node) -> str:
-    """Đệ quy chuyển đổi cây cấu trúc JSON AST của Binance thành chuỗi HTML/Table hoàn chỉnh."""
-    if not isinstance(node, dict):
-      return ""
-    if node.get("node") == "text":
-      return node.get("text", "")
+# =====================================================================
+# 🔍 5. BỘ QUÉT NGUỒN DEALROOM (FUNDING & IPO)
+# =====================================================================
+class DealroomScanner:
+    """Quét và bóc tách dữ liệu bài viết vòng gọi vốn và IPO từ Dealroom.co."""
 
-    tag = node.get("tag", "")
-    children_html = "".join(
-        self._parse_binance_ast_node(c) for c in node.get("child", [])
-    )
+    def __init__(self, config: dict):
+        self.lenses = config.get("LENSES", [])
+        self.base_url = config.get("BASE_URL", "https://dealroom.co/news")
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
 
-    if tag:
-      attrs = node.get("attr", {})
-      attr_parts = []
-      if "href" in attrs:
-        attr_parts.append(f'href="{attrs["href"]}"')
-      if "src" in attrs:
-        attr_parts.append(f'src="{attrs["src"]}"')
-
-      attr_str = (" " + " ".join(attr_parts)) if attr_parts else ""
-
-      if tag in ["img", "br", "hr"]:
-        return f"<{tag}{attr_str} />"
-      return f"<{tag}{attr_str}>{children_html}</{tag}>"
-
-    return children_html
-
-  def extract_article_detail(self, article_code: str, default_url: str) -> dict:
-    """Lấy chi tiết toàn bộ nội dung, cấu trúc bảng và hình ảnh của một bài thông báo Binance."""
-    print(f"\n🌐 [Module 1] Đang trích xuất chi tiết Binance: [{article_code}]")
-    fallback_data = {
-        "url": default_url,
-        "title": "Binance Announcement Update",
-        "content": "",
-        "source_images": [],
-    }
-
-    try:
-      detail_url = f"https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query?articleCode={article_code}"
-      resp = requests.get(detail_url, headers=self.headers, timeout=15)
-      if resp.status_code != 200:
-        return fallback_data
-
-      data = resp.json().get("data", {})
-      title = data.get("title") or "Binance Official Announcement"
-      raw_body = data.get("body", "")
-
-      html_content = ""
-      if raw_body.startswith("{") and '"node":' in raw_body:
+    @staticmethod
+    def _format_deal_amount(raw_amt: str) -> str:
+        """Quy đổi số tiền deal raw thành chuỗi dễ đọc ($2B, $150M,...)."""
+        if not raw_amt:
+            return "Không công bố"
         try:
-          ast_tree = json.loads(raw_body)
-          html_content = self._parse_binance_ast_node(ast_tree)
+            val = float(raw_amt)
+            if val >= 1_000_000_000:
+                return f"${val / 1_000_000_000:.2f} Billion"
+            elif val >= 1_000_000:
+                return f"${val / 1_000_000:.1f} Million"
+            elif val >= 1_000:
+                return f"${val / 1_000:.0f}K"
+            return f"${val:,.0f}"
         except Exception:
-          html_content = raw_body
-      else:
-        html_content = raw_body
+            return raw_amt
 
-      soup = BeautifulSoup(html_content, "html.parser")
+    def fetch_latest_deals(self) -> list[dict]:
+        """Tải trang tin Dealroom và trích xuất danh sách bài viết theo từng lens."""
+        all_deals = []
+        for item in self.lenses:
+            lens = item["lens"]
+            lens_name = item["name"]
+            page_url = f"{self.base_url}/?lens={lens}"
 
-      # 1. Trích xuất hình ảnh
-      extracted_images = []
-      seen_img = set()
-      for img in soup.find_all("img"):
-        src = img.get("src", "").strip()
-        if (
-            src
-            and src.startswith("http")
-            and src not in seen_img
-            and not re.search(r"(icon|avatar|logo|\.svg)", src, re.I)
-        ):
-          seen_img.add(src)
-          extracted_images.append({
-              "url": src,
-              "caption": img.get("alt", "").strip(),
-              "alt": img.get("alt", "").strip(),
-          })
+            try:
+                resp = requests.get(page_url, headers=self.headers, timeout=15)
+                if resp.status_code != 200:
+                    print(f"⚠️ Dealroom HTTP {resp.status_code} ({page_url})")
+                    continue
 
-      # 2. Trích xuất văn bản & Bảng dữ liệu (Tables)
-      paragraphs = []
-      for elem in soup.find_all(["p", "h2", "h3", "li", "table"]):
-        if elem.name == "table":
-          rows = []
-          for tr in elem.find_all("tr"):
-            cells = [
-                th_td.get_text(separator=" ", strip=True)
-                for th_td in tr.find_all(["th", "td"])
-            ]
-            if cells and any(c for c in cells):
-              rows.append(" | ".join(cells))
-          if rows:
-            paragraphs.append("\n[DATA TABLE]:\n" + "\n".join(rows) + "\n")
-        else:
-          text = elem.get_text(strip=True)
-          if (
-              len(text) > 20
-              and not elem.find_parent("table")
-              and not elem.find_parent("figcaption")
-          ):
-            paragraphs.append(text)
+                soup = BeautifulSoup(resp.text, "html.parser")
+                # Thẻ bài viết trên Dealroom có thuộc tính data-lens tương ứng
+                cards = soup.find_all("div", attrs={"data-lens": lens})
 
-      content = "\n\n".join(paragraphs)
-      print(
-          f"✅ Trích xuất thành công {len(paragraphs)} đoạn/bảng (Độ dài:"
-          f" {len(content)} ký tự)."
-      )
-      print(f"📷 Tìm thấy {len(extracted_images)} ảnh gốc.")
+                for card in cards:
+                    link_tag = card.find("a", href=True)
+                    if not link_tag:
+                        continue
 
-      return {
-          "url": default_url,
-          "title": title,
-          "content": content,
-          "source_images": extracted_images,
-      }
+                    href = link_tag.get("href", "").strip()
+                    if not href.startswith("/news/"):
+                        continue
 
-    except Exception as e:
-      print(f"⚠️ Lỗi bóc tách bài {article_code}: {e}")
-      return fallback_data
+                    # ID của bài viết được lấy từ slug đường dẫn (/news/149496-cognition-raises...)
+                    slug = href.replace("/news/", "").strip("/")
+                    if not slug or slug in ["archive"]:
+                        continue
 
+                    # Tìm tiêu đề bài viết
+                    title_elem = (
+                        card.find(["h2", "h3", "h4", "div"], class_=lambda cl: cl and any(x in cl for x in ["title", "headline", "name"]))
+                        or link_tag
+                    )
+                    title = title_elem.get_text(strip=True) if title_elem else "No Title"
 
-# =====================================================================
-# 🤖 MODULE 2: AI PROCESSOR (GEMINI + WORDPRESS SEO + TABLES)
-# =====================================================================
-class ArticleOutputSchema(BaseModel):
-  editorial_plan: str
-  title: str
-  slug: str
-  meta_description: str
-  categories: str
-  key_takeaways: list[str]
-  image_prompt: str
-  content_html: str
+                    # Trích xuất số tiền, ngày giờ và lĩnh vực
+                    raw_amt = card.get("data-amt", "")
+                    amount_formatted = self._format_deal_amount(raw_amt)
+                    sector = card.get("data-sector", "Technology")
+                    geo = card.get("data-geo", "Global")
+                    ts = card.get("data-ts")
 
+                    date_str = ""
+                    if ts:
+                        try:
+                            dt = datetime.fromtimestamp(int(ts) / 1000)
+                            date_str = dt.strftime("%Y-%m-%d %H:%M")
+                        except Exception:
+                            date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    else:
+                        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-class AIProcessor:
+                    full_url = f"https://dealroom.co{href}" if href.startswith("/") else href
 
-  def __init__(
-      self,
-      api_key: str,
-      model_id: str,
-      csv_log_path: str,
-      site_url: str,
-      platform: str = "VB",
-      fallback_models: list[str] | None = None,
-  ):
-    self.gemini = GeminiFallbackClient(
-        api_key=api_key, model_id=model_id, fallback_models=fallback_models
-    )
-    self.model_id = model_id
-    self.csv_log_path = os.path.abspath(csv_log_path)
-    self.site_url = site_url.rstrip("/")
-    self.platform = platform.upper()
+                    all_deals.append({
+                        "source": "DEALROOM",
+                        "article_id": slug,
+                        "lens": lens,
+                        "lens_name": lens_name,
+                        "title": title,
+                        "url": full_url,
+                        "raw_amount": raw_amt,
+                        "amount_formatted": amount_formatted,
+                        "sector": sector,
+                        "geo": geo,
+                        "date_str": date_str,
+                    })
 
-  def _get_dynamic_internal_links(self, max_links: int = 10) -> list[dict]:
-    """Đọc file CSV bài viết cũ, trích xuất slug và title."""
-    links = []
-    if not os.path.exists(self.csv_log_path):
-      return links
+            except Exception as e:
+                print(f"⚠️ Lỗi quét Dealroom lens={lens}: {e}")
 
-    try:
-      with open(self.csv_log_path, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-          if not isinstance(row, dict):
-            continue
-          clean_row = {
-              str(k).strip(): str(v).strip()
-              for k, v in row.items()
-              if k is not None
-          }
-          slug = (
-              clean_row.get("Post Slug")
-              or clean_row.get("slug")
-              or clean_row.get("Post slug")
-              or ""
-          )
-          title = (
-              clean_row.get("Post Title")
-              or clean_row.get("title")
-              or clean_row.get("Post title")
-              or ""
-          )
-
-          if (
-              slug
-              and slug.lower() != "none"
-              and slug != "post-thumb"
-              and not slug.startswith("http")
-          ):
-            clean_slug = slug.strip("/")
-            full_url = f"{self.site_url}/{clean_slug}"
-            clean_title = (
-                title if title else clean_slug.replace("-", " ").title()
-            )
-            links.append(
-                {"title": clean_title, "slug": clean_slug, "url": full_url}
-            )
-
-      return links[-max_links:] if len(links) > max_links else links
-    except Exception as e:
-      print(f"⚠️ Lỗi đọc CSV: {e}")
-      return []
-
-  def _force_inject_latest_links(
-      self, html_content: str, links: list[dict]
-  ) -> str:
-    """Đảm bảo bài viết luôn có link theo format 'More Update: title'."""
-    if not links:
-      return html_content
-
-    target_link = links[-1]
-    target_url = target_link["url"]
-    target_title = target_link["title"]
-
-    link_html = (
-        f"<p style='margin-top: 15px;'><em>More Update: <a href='{target_url}'"
-        f" style='color: #00AF61; font-weight:"
-        f" 600;'>{target_title}</a></em></p>"
-    )
-
-    if target_url in html_content:
-      return html_content
-
-    paragraphs = re.findall(r"<p.*?>.*?</p>", html_content, flags=re.DOTALL)
-    if len(paragraphs) >= 3:
-      mid_idx = len(paragraphs) // 2
-      replacement = paragraphs[mid_idx] + "\n" + link_html
-      html_content = html_content.replace(paragraphs[mid_idx], replacement, 1)
-    elif "<p><em>Source:" in html_content:
-      html_content = html_content.replace(
-          "<p><em>Source:", f"{link_html}\n<p><em>Source:"
-      )
-    else:
-      html_content += f"\n{link_html}"
-
-    print(f"✅ Đã chèn Internal Link: More Update: {target_title}")
-    return html_content
-
-  def process(self, raw_data: dict) -> dict:
-    platform_name = "Ventureburn" if self.platform == "VB" else "Chainplay"
-    print(f"🤖 [Module 2] Đang gửi nội dung sang Gemini biên tập ({platform_name} SEO English)...")
-    internal_links = self._get_dynamic_internal_links()
-    internal_links_json = json.dumps(
-        internal_links, ensure_ascii=False, indent=2
-    )
-    source_images_json = json.dumps(
-        raw_data.get("source_images", []), ensure_ascii=False, indent=2
-    )
-
-    if self.platform == "VB":
-      persona = (
-          "You are a senior financial & technology SEO editor for Ventureburn (a premier global digital publication covering tech innovation, Web3, cryptocurrency, startups, and capital markets). "
-          "Your task is to analyze the extracted official Binance announcement, structure a comprehensive editorial outline, and write an authoritative, highly engaging news story in ENGLISH for investors, tech founders, and crypto traders."
-      )
-      source_citation = f"<p><em>Source: <a href='{raw_data.get('url', '')}' target='_blank'>Binance Official Announcement</a> via Ventureburn</em></p>"
-      image_prompt_rule = """
-6. IMAGE PROMPT RULE (16:9 TECH NEWS BRANDED POSTER):
-   Synthesize an Image Generation Prompt strictly following these visual styling rules:
-
-   - ASPECT RATIO: 16:9 widescreen landscape (1600x900 / 1312x736).
-
-   - OVERALL AESTHETIC & RENDERING STYLE:
-     * STYLE: High-end 3D tech diorama illustration, sleek Octane/Redshift 3D render, miniature architectural tech studio aesthetic. Smooth clay-matte materials combined with glossy reflective dark floor surfaces.
-     * ENVIRONMENT & SCENE: A futuristic dark interior space (e.g., high-tech lab, control room, server corridor, or conceptual trading floor). Sharp linear neon light strips tracing along the ceiling, perspective walls, and floor boundaries.
-     * THEMATIC CHARACTERS & OBJECTS: 
-       - Stylized faceless or low-poly 3D miniature human figures in professional suits or lab coats, interacting with floating holographic HUD screens, digital charts, and monitors.
-       - A prominent 3D symbolic hero object placed in the foreground/table center (e.g., glowing tech sphere, metallic bull, digital node, cyber hardware device).
-
-   - TEXT RENDERING & POSITIONING (PROMINENT SHORT HEADLINE ONLY):
-     * POSITION: Top-left or top-center quadrant, clean 2-4 lines multiline headline layout.
-     * CONDENSED HEADLINE RULE (CRITICAL):
-       - DO NOT use the full article title. 
-       - Condense the main event into an ultra-short, high-impact headline of STRICTLY 3 TO 5 WORDS MAXIMUM (Format: "[SUBJECT] [VERB] [METRIC/KEYWORD]").
-       - Examples of ideal length: "BINANCE LISTS TOKEN", "AIRDROP POOL LIVE", "TRADING REWARDS LAUNCH".
-     * EXACT TEXT CONTENT: Wrap this exact 3-5 word condensed title in double quotes (e.g., "SHORT PUNCHY TITLE").
-     * TYPOGRAPHY STYLE: Massive, ultra-bold, modern geometric sans-serif (Inter / Helvetica Black style), flat fill, perfectly legible.
-     * TEXT COLOR: High-contrast pure stark white (#FFFFFF) for the primary headline, and vivid radiant electric lime (#00FF66 / #25F47E) for framed highlight numbers. Solid flat vector fill, razor-sharp vector borders, zero 3D bevels.
-     * STRICT ZERO-TOLERANCE TEXT NEGATIVE: Strictly NO extra unrequested text, no secondary subtitles, no body paragraphs, no watermarks, no illegible gibberish. ONLY the 3-5 word headline and the single central framed metric text.
-     
-   - COLOR PALETTE & LIGHTING (VIBRANT ULTRA-SATURATED NEON TONE):
-     * DOMINANT GREEN THEME: A vivid, hyper-saturated radioactive emerald and electric jade environment (#00FF66 to #044421 rich dynamic gradient), fully illuminated with intense photoluminescent green glow, zero muddy darkness.
-     * BRIGHT GRID PERSPECTIVE: Ultra-luminous cyber-lime perspective grid floor (#00FF88 / #39FF14) with brilliant glowing neon tiles reflecting laser-sharp specular highlights across mirror-polished dark obsidian surfaces.
-     * MULTI-COLOR NEON ACCENTS: Saturated, blazing neon conduit tubes and glowing cable loops framing the center, clashing electric cyber lime (#00FF66) with intense fluorescent laser cyan (#00F0FF) and radiant vivid ultraviolet (#D946EF) for extreme chromatic vibrancy.
-     * WARM CHROMATIC ACCENTS: Blazing, high-intensity neon amber-orange (#FF5500) and golden solar-yellow (#FFD700) illuminated beacons that violently pop with sharp complementary contrast against the vibrant green atmosphere.
-     * LIGHTING & RENDERING AESTHETIC: Hyper-saturated 3D Octane render, heavy neon bloom glow, crisp volumetric light rays, intense chromatic bounce lighting, glossy wet-reflective specular highlights, razor-sharp vector clarity.
-     * STRICT NEGATIVE FILTER: NO monochromatic dull tones, NO dark muddy shadows, NO pitch-black dead space, NO washed-out desaturated pastels, NO flat dim lighting, NO dusty or grainy textures, NO photorealistic gritty noise.
-
-   - ZERO-TOLERANCE TEXT & ARTIFACT RESTRICTIONS:
-     * MANDATE: The ONLY permitted text on the canvas is the quoted headline in the top-left.
-     * NEGATIVE FILTER: Strictly NO corner logos, NO tiny brand icons, NO watermarks, NO badges, NO subtitles, NO micro-text, NO pseudocode/runes, NO surface model/serial numbers, NO blurry clutter, NO UI HUD elements.
-"""
-    else:
-      persona = (
-          "You are a senior financial & cryptocurrency journalist and SEO editor for Chainplay (a leading Web3 & Crypto publication). "
-          "Your task is to analyze the extracted official Binance announcement, structure a comprehensive editorial outline, and write an authoritative, highly engaging news story in ENGLISH for crypto traders, Web3 gamers, and investors."
-      )
-      source_citation = f"<p><em>Source: <a href='{raw_data.get('url', '')}' target='_blank'>Binance Official Announcement</a> via Chainplay</em></p>"
-      image_prompt_rule = """
-6. IMAGE PROMPT RULE (16:9 MINIMALIST SILHOUETTE & PULP SCI-FI POSTER):
-    Synthesize an Image Generation Prompt strictly following these visual specifications:
-
-    - ASPECT RATIO: 16:9 widescreen landscape.
-
-    - ART STYLE & AESTHETIC (CRITICAL):
-      * Minimalist Silhouette Poster Art combining Retro Pulp Sci-Fi and Western Graphic Novel aesthetics (inspired by vintage pulp sci-fi and Olly Moss minimalist sunset posters).
-      * Clean 2D vector graphic art, bold flat shapes, sharp silhouette cutouts, and crisp geometric precision (STRICTLY NOT photorealistic, NOT 3D render/CGI).
-
-    - FOREGROUND & SILHOUETTES:
-      * Solid pitch-black silhouettes (flat solid black shapes) for all foreground subjects, terrain, characters, cybernetic figures, crypto hardware, retro vehicles, or architectural structures matching the announcement theme.
-      * Subtle warm rim lighting/edge glow reflecting from the sunset background onto silhouette edges.
-
-    - COMPOSITION & BACKGROUND:
-      * MINIMALIST GRAPHIC COMPOSITION: Clean flat horizon with a giant, majestic glowing sun / celestial circle dominating the center or backdrop, framing the silhouette subject.
-      * Atmospheric depth created through layered flat silhouettes (distant dunes, futuristic towers, mountains, or landscape).
-
-    - COLOR PALETTE & LIGHTING:
-      * WARM MONOCHROMATIC GRADIENT: High-contrast warm sunset sky transitioning smoothly from radiant bright golden yellow -> blazing fiery orange -> deep crimson / brick red -> dark twilight dusk.
-      * High contrast, dramatic atmospheric glow, clean vintage poster tones.
-
-    - TEXT RENDERING & POSITIONING (PROMINENT SHORT HEADLINE ONLY):
-      * POSITION: Upper sky quadrant or top-center, clean multiline headline layout.
-      * CONDENSED HEADLINE RULE (CRITICAL):
-        - DO NOT use the full article title. 
-        - Condense the main event into an ultra-short, high-impact headline of STRICTLY 3 TO 5 WORDS MAXIMUM (Format: "[SUBJECT] [VERB] [METRIC/KEYWORD]").
-        - Examples of ideal length: "BINANCE LISTS NEW TOKEN", "AIRDROP REWARD POOL OPEN", "TRADING TOURNAMENT LAUNCHES".
-      * EXACT TEXT CONTENT: Wrap this exact 3-5 word condensed title in double quotes (e.g., "SHORT PUNCHY TITLE").
-      * TYPOGRAPHY STYLE: Massive, ultra-bold, modern geometric sans-serif (Inter / Helvetica Black / Bold Display style), perfectly crisp and legible.
-      * TEXT COLOR: High-contrast solid pure white (#FFFFFF) or warm golden yellow (#FFDD55). Completely flat.
-      * STRICT ZERO-TOLERANCE TEXT NEGATIVE: Strictly NO extra unrequested text, no secondary subtitles, no body paragraphs, no watermarks, no illegible gibberish. ONLY the 3-5 word headline in double quotes.
-
-    - STRICT NEGATIVE FILTER:
-      * No photorealistic CGI, no 3D octane render, no muddy textures, no washed-out pastel tones, no cluttered backgrounds.
-"""
-
-    prompt = f"""
-{persona}
-
-======================================================================
-INPUT DATA
-======================================================================
-ORIGINAL TITLE: {raw_data.get('title', '')}
-ORIGINAL URL: {raw_data.get('url', '')}
-ORIGINAL CONTENT:
-{raw_data.get('content', '')}
-
-AVAILABLE SOURCE IMAGES:
-{source_images_json}
-
-DYNAMIC INTERNAL LINKS REPOSITORY:
-{internal_links_json}
-
-======================================================================
-PHASE 1: EDITORIAL PLANNING & VERIFICATION (`editorial_plan`)
-======================================================================
-1. FACT-CHECK & METRIC AUDIT: Extract all exact token names, ticker symbols, listing dates/times (UTC), trading pairs, prize pools, deposit schedules, and fee details.
-2. ANGLE & HOOK FORMULATION: Identify the primary news angle that matters most to active traders and community members.
-3. BLUEPRINT & PACING: Outline sections with clear talking points, natural burstiness, and accurate data preservation.
-
-======================================================================
-PHASE 2: ARTICLE DRAFTING RULES (`content_html`)
-======================================================================
-1. TARGET ARTICLE LENGTH (~400 WORDS / 380 - 450 WORDS):
-   - Provide a comprehensive, engaging, professional crypto news article matching top publication standards (CoinDesk, Cointelegraph).
-   - Structure logically into 3 distinct sections with 2 to 3 topic-specific <h2> tags:
-     a) Journalistic Lead (No H2 heading, ~60-80 words): A punchy, hook-driven intro answering Who, What, When, and Key Reward/Metric numbers.
-     b) Core Mechanics & Feature Breakdown (~150-180 words under <h2>): Thoroughly explain the background of the token/event, promotion phases, prize pool allocation, and special boost multipliers.
-     c) Participation Guide & Eligibility (~120-150 words under <h2>): Step-by-step practical guide on how traders can participate via Binance Wallet / Alpha / Web3, exact qualifying rules (e.g. buy volume criteria, timeframes, snapshot dates, reward distribution timeline).
-
-2. ADAPTIVE LENGTH & ZERO FLUFF:
-   - Rely EXCLUSIVELY on verified facts from source. Zero hallucinations.
-   - BANNED CLICHÉS: "delve into", "testament to", "ever-evolving", "tapestry", "pivotal", "game-changer", "moreover", "in conclusion", "beacon", "underscores".
-   - Maintain natural sentence cadence and burstiness (mix 3-5 word sentences with 15-20 words).
-   - Use single quotes (') for all HTML attributes.
-   - DATA TABLES: If the source contains tables or structured metrics (e.g., listing schedule, trading pairs, reward pools, fee tiers, tokenomics, multipliers), format them into clean, responsive WordPress HTML tables:
-     <table class='wp-block-table' style='width: 100%; border-collapse: collapse; margin: 15px 0;'><thead><tr><th>Column 1</th><th>Column 2</th></tr></thead><tbody><tr><td>Data 1</td><td>Data 2</td></tr></tbody></table>
-   - Embed original source figures under relevant <h2> if available:
-     <figure class='wp-block-image'><img src='[IMAGE_URL]' alt='[ALT_TEXT]' /><figcaption>[ORIGINAL_CAPTION]</figcaption></figure>
-   - Append source citation at the very end:
-     {source_citation}
-
-3. KEY TAKEAWAYS: Strictly 3 concise bullet points in `key_takeaways` array (Plain text only, NO HTML).
-4. METADATA:
-   - slug: 3-5 words, lowercase, hyphen-separated.
-   - meta_description: STRICTLY SHORT (100 - 130 characters maximum). A single punchy, high-impact sentence summarizing the core hook without truncation.
-   - categories: 3-5 relevant comma-separated tags (e.g., Binance, Crypto Listing, Airdrop, Trading).
-
-{image_prompt_rule}
-"""
-
-    def _parse_article(resp) -> dict:
-      try:
-        parsed = json.loads(resp.text)
-      except Exception:
-        parsed = json.loads(repair_json(resp.text))
-      if not isinstance(parsed, dict) or not parsed.get("content_html"):
-        raise ValueError("JSON bài viết thiếu content_html")
-      return parsed
-
-    _, result = self.gemini.generate(
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ArticleOutputSchema,
-            max_output_tokens=9192,
-            temperature=0.6,
-        ),
-        validate=_parse_article,
-        label="Module 2",
-    )
-
-    if not isinstance(result.get("key_takeaways"), list):
-      result["key_takeaways"] = []
-
-    result["content_html"] = self._force_inject_latest_links(
-        result.get("content_html", ""), internal_links
-    )
-    return result
+        return all_deals
 
 
 # =====================================================================
-# 🔍 MODULE 2.5: AI DETECTOR & CONTENT HUMANIZER
+# 🎮 5. BỘ QUÉT NGUỒN BEEBOM (ROBLOX CODES)
 # =====================================================================
-class AICheckResult(BaseModel):
-  ai_percentage: int
-  verdict: str
-  flagged_phrases: list[str]
-
-
-class AICheckerModule:
-
-  def __init__(
-      self,
-      api_key: str,
-      check_model: str,
-      rewrite_model: str,
-      fallback_models: list[str] | None = None,
-  ):
-    self.check_gemini = GeminiFallbackClient(
-        api_key=api_key, model_id=check_model, fallback_models=fallback_models
-    )
-    self.rewrite_gemini = GeminiFallbackClient(
-        api_key=api_key, model_id=rewrite_model, fallback_models=fallback_models
-    )
-    self.check_model = check_model
-    self.rewrite_model = rewrite_model
-
-  def _extract_plain_text(self, html_content: str) -> str:
-    soup = BeautifulSoup(html_content, "html.parser")
-    for tag in soup.find_all(["figcaption", "em"]):
-      tag.decompose()
-    return soup.get_text(separator=" ", strip=True)
-
-  def evaluate_score(self, html_content: str) -> dict:
-    plain_text = self._extract_plain_text(html_content)
-    prompt = f"""
-You are an expert AI detection classifier calibrated to detect LLM writing patterns.
-Analyze the following text and assign an estimated AI generation probability percentage (0 to 100).
-
-EVALUATION CRITERIA:
-- Uniform sentence cadence and lack of structural variation (high AI score).
-- Overuse of transitional clichés: "delve", "testament", "pivotal", "landscape", "crucial role", "furthermore".
-- Organic sentence mix with rich gaming/finance terminology and varying lengths (low AI score / human).
-
-TEXT SAMPLE:
-\"\"\"{plain_text[:2500]}\"\"\"
-"""
-    try:
-      def _parse_check(resp) -> dict:
-        try:
-          parsed = json.loads(resp.text)
-        except Exception:
-          parsed = json.loads(repair_json(resp.text))
-        if not isinstance(parsed, dict) or "ai_percentage" not in parsed:
-          raise ValueError("JSON chấm điểm thiếu ai_percentage")
-        return parsed
-
-      _, result = self.check_gemini.generate(
-          contents=prompt,
-          config=types.GenerateContentConfig(
-              response_mime_type="application/json",
-              response_schema=AICheckResult,
-              temperature=0.1,
-          ),
-          validate=_parse_check,
-          label="Module 2.5 Check",
-      )
-      return result
-    except Exception as e:
-      print(f"⚠️ [Module 2.5] Lỗi khi dùng {self.check_model} chấm điểm: {e}")
-      return {"ai_percentage": 0, "verdict": "Check Failed", "flagged_phrases": []}
-
-  def humanize_content(
-      self, html_content: str, flagged_phrases: list[str]
-  ) -> str:
-    prompt = f"""
-Rewrite the following article to sound 100% human-written in ENGLISH.
-
-CURRENT HTML CONTENT:
-{html_content}
-
-CRITICAL REWRITE RULES:
-1. STRUCTURAL INTEGRITY: Preserve ALL HTML tags (<h2>, <figure>, <figcaption>, <img>, <a>, <table>, <thead>, <tbody>, <tr>, <th>, <td>). NEVER drop tables, internal links (<p><em>More Update: ...</em></p>), or source links.
-2. PURGE CLICHÉS: Completely remove these flagged robotic words: {json.dumps(flagged_phrases)}.
-3. DISTRIBUTED BURSTINESS: Interweave ultra-short sentences (3-5 words), medium sentences (10-15 words), and complex compound clauses (25+ words).
-4. VOCABULARY: Use authentic natural journalistic flow. Never start consecutive sentences with the same subject.
-5. LENGTH RETENTION: Maintain the full informative depth and ~380-450 word length. Do NOT summarize or condense sections.
-
-Output ONLY valid HTML body string.
-"""
-    try:
-      resp, _ = self.rewrite_gemini.generate(
-          contents=prompt,
-          config=types.GenerateContentConfig(temperature=0.85),
-          label="Module 2.5 Humanize",
-      )
-      return (
-          resp.text.strip()
-          .replace("```html", "")
-          .replace("```json", "")
-          .replace("```", "")
-      )
-    except Exception as e:
-      print(f"⚠️ Humanize thất bại trên mọi model/key, giữ nội dung gốc: {e}")
-      return html_content
-
-  def process(self, article_data: dict, threshold: int = 35) -> dict:
-    html_content = article_data.get("content_html", "")
-    if not html_content:
-      return article_data
-
-    eval_data = self.evaluate_score(html_content)
-    score = eval_data.get("ai_percentage", 0)
-    flagged = eval_data.get("flagged_phrases", [])
-
-    print(
-        f"🔍 [Module 2.5] Model [{self.check_model}] chấm AI Score: {score}% |"
-        f" Đánh giá: {eval_data.get('verdict')}"
-    )
-
-    if score > threshold:
-      print(
-          f"⚠️ AI Score ({score}%) > {threshold}%. Đang dùng"
-          f" [{self.rewrite_model}] Humanize lại..."
-      )
-      article_data["content_html"] = self.humanize_content(
-          html_content, flagged
-      )
-      recheck = self.evaluate_score(article_data["content_html"])
-      final_score = recheck.get("ai_percentage", 0)
-      article_data["ai_score"] = final_score
-      print(
-          f"✨ [Module 2.5] Điểm sau Humanize: {final_score}%"
-          f" ({recheck.get('verdict')})"
-      )
-    else:
-      print(
-          f"✅ [Module 2.5] Bài viết đạt chuẩn an toàn (<={threshold}% AI). Sẵn"
-          " sàng đăng tải!"
-      )
-      article_data["ai_score"] = score
-
-    return article_data
-
-
-# =====================================================================
-# 📦 MODULE 3: IMAGE GENERATOR (Hugging Face + Watermark Logo)
-# =====================================================================
-class HFImageEngine:
-
-  def __init__(self, config: dict):
-    self.enabled = config.get("ENABLE_GENERATION", True)
-    self.platform = config.get("PLATFORM", "VB").upper()
-    self.api_token = config.get("HF_API_TOKEN")
-    self.model_id = config.get("HF_MODEL_ID")
-    self.output_dir = config.get("OUTPUT_DIR", os.path.abspath("./downloads"))
-    
-    # Tự động gán logo theo thương hiệu
-    default_logo_file = "VB_white_logo.png" if self.platform == "VB" else "CP_white_logo.png"
-    logo_candidate = config.get("LOGO_PATH") or os.path.join(BASE_DIR, default_logo_file)
-    if not os.path.exists(logo_candidate):
-      alt_candidate = os.path.join(os.path.dirname(BASE_DIR), "tk_bot", default_logo_file)
-      if os.path.exists(alt_candidate):
-        logo_candidate = alt_candidate
-    self.logo_path = logo_candidate
-    os.makedirs(self.output_dir, exist_ok=True)
-
-    # Cấu hình color_enforcement_suffix chuẩn thương hiệu
-    if "COLOR_ENFORCEMENT_SUFFIX" in config:
-      self.color_enforcement_suffix = config["COLOR_ENFORCEMENT_SUFFIX"]
-    elif self.platform == "VB":
-      # Bộ màu thương hiệu Ventureburn chuẩn trích xuất từ vb_wp_poster.ipynb
-      self.color_enforcement_suffix = (
-          " glowing radioactive electric lime #00FF66, vivid laser cyan #00F0FF, radiant hot magenta accents, "
-          "glossy mirror-like floor reflections, heavy neon bloom glow cold color temperature, cinematic Octane render, "
-          "razor-sharp contrast, volumetric lighting, 2k resolution, photorealistic, no red orange, no watermarks, no extra text"
-      )
-    else:
-      # Bộ màu thương hiệu Chainplay chuẩn (Pulp Sci-Fi Sunset)
-      self.color_enforcement_suffix = (
-          ",minimalist silhouette poster art style, retro pulp sci-fi and western graphic novel aesthetic,"
-          " solid flat black silhouettes, crisp vector shapes, giant glowing circular sunset sun backdrop,"
-          " warm monochromatic sunset gradient from golden yellow to fiery orange to deep crimson red,"
-          " minimalist graphic composition, flat 2D vector art, no 3D render, no photorealistic"
-      )
-
-    if self.enabled and self.api_token:
-      self.client = InferenceClient(
-          model=self.model_id, token=self.api_token, timeout=90
-      )
-
-  def _apply_logo(self, base_image: Image.Image) -> Image.Image:
-    if not self.logo_path or not os.path.exists(self.logo_path):
-      print(f"ℹ️ [Module 3] Bỏ qua chèn logo (không tìm thấy file: {self.logo_path})")
-      return base_image
-
-    try:
-      logo = Image.open(self.logo_path).convert("RGBA")
-      target_logo_width = int(base_image.width * 0.14)
-      w_percent = target_logo_width / float(logo.size[0])
-      target_logo_height = int(float(logo.size[1]) * float(w_percent))
-      logo = logo.resize(
-          (target_logo_width, target_logo_height), Image.Resampling.LANCZOS
-      )
-
-      pos_x = int((base_image.width - target_logo_width) / 2)
-      pos_y = int(base_image.height - target_logo_height - 25)
-      position = (pos_x, pos_y)
-
-      base_rgba = base_image.convert("RGBA")
-      base_rgba.paste(logo, position, logo)
-      return base_rgba.convert("RGB")
-    except Exception as e:
-      print(f"⚠️ Không thể chèn logo: {e}")
-      return base_image
-
-  def generate_and_download(self, prompt: str, slug: str) -> tuple[str | None, str]:
-    if not self.enabled:
-      return None, "Skipped (Disabled by user)"
-
-    final_prompt = prompt + self.color_enforcement_suffix
-
-    brand_label = "Ventureburn (VB)" if self.platform == "VB" else "Chainplay (CP)"
-    print(f"🎨 [Module 3] Đang tạo ảnh 16:9 phong cách {brand_label} với {self.model_id}...")
-    try:
-      raw_image: Image.Image = self.client.text_to_image(
-          prompt=final_prompt, width=1600, height=900
-      )
-      target_size = (1600, 900)
-      fitted_image = ImageOps.fit(
-          raw_image, target_size, method=Image.Resampling.LANCZOS
-      )
-      final_image = self._apply_logo(fitted_image)
-
-      file_name = f"{slug[:50]}_{int(time.time())}.jpg"
-      file_path = os.path.join(self.output_dir, file_name)
-      final_image.save(file_path, "JPEG", quality=95)
-
-      print(f"✅ Đã lưu ảnh hoàn chỉnh tại: {file_path}")
-      return file_path, f"Success ({file_name})"
-    except Exception as e:
-      err_msg = str(e)
-      print(f"⚠️ Lỗi kết nối tạo ảnh Hugging Face: {err_msg}")
-      return None, f"Failed ({err_msg[:60]})"
-
-
-# =====================================================================
-# 📦 MODULE 4: WORDPRESS PUBLISHER (Playwright Headless / Server Ready)
-# =====================================================================
-class WordPressPublisher:
-
-  def __init__(self, config: dict):
-    self.site_url = config.get("SITE_URL", "").rstrip("/")
-    self.login_url = config.get("LOGIN_URL", f"{self.site_url}/wp-login.php")
-    self.username = config.get("USERNAME", "")
-    self.password = config.get("PASSWORD", "")
-    self.profile_dir = config.get("PROFILE_DIR", os.path.abspath("./wp_profile"))
-    self.headless = config.get("HEADLESS", True)
-    self.output_dir = os.path.abspath("./downloads")
-    os.makedirs(self.profile_dir, exist_ok=True)
-    os.makedirs(self.output_dir, exist_ok=True)
-
-  # Trang chặn bot (Cloudflare / WAF của host) - KHÔNG phải trang đăng nhập
-  _CHALLENGE_MARKERS = ("attention required", "just a moment", "checking your browser", "verify you are human")
-  _ADMIN_SELECTOR = "#wpadminbar, .edit-post-layout, .editor-header, .block-editor, #wpbody"
-
-  async def _is_challenge(self, page) -> bool:
-    # Trang có thể đang chuyển hướng (Cloudflare/WP redirect) -> chờ ổn định rồi thử lại
-    for _ in range(3):
-      try:
-        await page.wait_for_load_state("domcontentloaded", timeout=15000)
-        title = (await page.title()).lower()
-        if any(m in title for m in self._CHALLENGE_MARKERS) or "wsidchk=" in page.url:
-          return True
-        return await page.query_selector("#challenge-form, #cf-wrapper, .cf-error-details") is not None
-      except Exception:
-        await asyncio.sleep(2)
-    return "wsidchk=" in page.url
-
-  async def _is_logged_in_admin(self, page, wait_ms: int = 8000) -> bool:
-    """Chỉ coi là đã đăng nhập khi THẤY giao diện admin (Gutenberg load chậm nên chờ một chút)."""
-    try:
-      await page.wait_for_selector(self._ADMIN_SELECTOR, timeout=wait_ms)
-      return True
-    except Exception:
-      return False
-
-  async def _wait_out_challenge(self, page) -> bool:
-    """Trang Cloudflare: headless thì báo thất bại; có cửa sổ thì chờ người dùng tự xác nhận (tối đa 3 phút)."""
-    if not await self._is_challenge(page):
-      return True
-    if getattr(self, "_headless_now", True):
-      print(f"🛡️ Bị Cloudflare chặn tại {page.url[:80]}... (headless không vượt được).")
-      return False
-    print("🛡️ Bị Cloudflare chặn. Vui lòng tự xác nhận trên cửa sổ trình duyệt (chờ tối đa 3 phút)...")
-    for _ in range(90):
-      await asyncio.sleep(2)
-      if not await self._is_challenge(page):
-        print("✅ Đã qua trang Cloudflare.")
-        return True
-    print("❌ Hết thời gian chờ xác nhận Cloudflare.")
-    return False
-
-  async def _needs_login(self, page, response=None) -> bool:
-    """True nếu CHƯA vào được trang admin: 404, trang login, trang chặn bot, hoặc bất kỳ trang nào không có giao diện admin."""
-    if await self._is_challenge(page):
-      return True
-    if response is not None and response.status == 404:
-      return True
-    if "login" in page.url.lower():
-      return True
-    return not await self._is_logged_in_admin(page)
-
-  async def _do_login_form(self, page) -> bool:
-    """Điền form đăng nhập trên trang hiện tại. Trả về True nếu đã submit."""
-    try:
-      await page.wait_for_selector("#user_login, input[name='log']", timeout=15000)
-    except Exception:
-      print(f"⚠️ Không thấy form đăng nhập tại {page.url}")
-      return False
-    await page.fill("#user_login, input[name='log']", self.username)
-    await page.fill("#user_pass, input[name='pwd']", self.password)
-    remember = await page.query_selector("#rememberme, input[name='rememberme']")
-    if remember:
-      await remember.check()
-    submit_btn = await page.query_selector(
-        "#wp-submit, button[type='submit'], input[type='submit']"
-    )
-    if not submit_btn:
-      print("⚠️ Không thấy nút đăng nhập.")
-      return False
-    await submit_btn.click()
-    try:
-      await page.wait_for_load_state("networkidle", timeout=30000)
-    except Exception:
-      pass
-    await asyncio.sleep(2)
-    return True
-
-  async def _ensure_login(self, page, response=None, target_url: str | None = None) -> bool:
+class BeebomScanner:
     """
-    Fallback đăng nhập:
-      1. Nếu trang trả 404 / trang login / không có admin bar ➔ coi như chưa đăng nhập.
-      2. Mở LOGIN_URL (vd: https://ventureburn.com/tklogin/) và đăng nhập bằng tài khoản trong tk_key.env.
-      3. Quay lại target_url (trang tạo bài).
-    Trả về True nếu đã đăng nhập (hoặc vốn đã đăng nhập).
+    Bộ quét tự động trang Roblox Codes của Beebom:
+    - Cơ chế kép (Dual-Engine):
+      1. Ưu tiên truy vấn WP-JSON REST API: Siêu nhanh, cấu trúc JSON chính xác.
+      2. Fallback sang BeautifulSoup HTML Parsing: Bóc tách DOM thẻ <article> nếu API bị lỗi.
     """
-    if not await self._wait_out_challenge(page):
-      return False
-    if not await self._needs_login(page, response):
-      return True
 
-    status = response.status if response is not None else "?"
-    print(f"🔑 Chưa đăng nhập (HTTP {status}, URL: {page.url}). Chuyển sang trang đăng nhập: {self.login_url}")
-    if not self.username or not self.password:
-      print("⚠️ Thiếu VB_WP_USER/VB_WP_PASSWORD hoặc CP_WP_USER/CP_WP_PASSWORD trong tk_key.env, bỏ qua tự động đăng nhập.")
-      return False
+    def __init__(self, config: dict):
+        self.tag_name = config.get("TAG_NAME", "Roblox Codes")
+        self.tag_url = config.get("TAG_URL", "https://beebom.com/tag/roblox-codes/")
+        self.api_url = config.get(
+            "API_URL", "https://beebom.com/wp-json/wp/v2/posts?tags=253215&per_page=15"
+        )
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
 
-    for attempt in range(1, 3):
-      try:
-        if "login" not in page.url.lower() or attempt > 1:
-          await page.goto(self.login_url, timeout=60000, wait_until="domcontentloaded")
-          await asyncio.sleep(1)
-        if not await self._wait_out_challenge(page):
-          return False
-        if not await self._do_login_form(page):
-          continue
-        if "login" in page.url.lower() and await page.query_selector("#login_error"):
-          err = (await page.inner_text("#login_error")).strip()
-          print(f"❌ WordPress từ chối đăng nhập: {err}")
-          return False
-        if target_url:
-          resp = await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
-          await asyncio.sleep(2)
-          if not await self._needs_login(page, resp):
-            print("✅ Đăng nhập thành công, đã quay lại trang tạo bài.")
-            return True
-          print(f"⚠️ Lần {attempt}: vẫn chưa vào được {target_url} sau khi đăng nhập.")
-        else:
-          print("✅ Đã gửi form đăng nhập.")
-          return True
-      except Exception as e:
-        print(f"⚠️ Lỗi tự động đăng nhập (lần {attempt}): {e}")
-    return False
+    def fetch_latest_articles(self) -> list[dict]:
+        """
+        Lấy danh sách các bài viết cập nhật code Roblox mới nhất.
+        Trả về danh sách dict chuẩn hóa.
+        """
+        # 1. Thử qua WordPress REST API (Nhanh và ổn định nhất)
+        articles = self._fetch_via_api()
+        if articles:
+            return articles
 
-  async def _upload_file_to_wp(self, page, file_path: str) -> dict | None:
-    """Upload ảnh lên WP Media Library qua REST API sử dụng Session Nonce."""
-    try:
-      nonce = await page.evaluate("""() => {
-                if (window.wpApiSettings && window.wpApiSettings.nonce) return window.wpApiSettings.nonce;
-                if (window._wpNonce) return window._wpNonce;
-                return '';
-            }""")
+        # 2. Fallback sang cào HTML nếu REST API thất bại
+        print("  ℹ️ Thử fallback sang cào HTML Beebom...")
+        return self._fetch_via_html()
 
-      filename = os.path.basename(file_path)
-      with open(file_path, "rb") as f:
-        file_bytes = f.read()
-
-      upload_url = f"{self.site_url}/wp-json/wp/v2/media"
-      headers = {
-          "Content-Disposition": f'attachment; filename="{filename}"',
-          "Content-Type": "image/jpeg",
-          "Cache-Control": "no-cache",
-      }
-      if nonce:
-        headers["X-WP-Nonce"] = nonce
-
-      response = await page.request.post(
-          upload_url, headers=headers, data=file_bytes
-      )
-      raw_text = await response.text()
-
-      if response.status in [200, 201]:
+    def _fetch_via_api(self) -> list[dict]:
+        """Truy vấn WP-JSON API."""
         try:
-          res_json = json.loads(raw_text)
-          media_id = res_json.get("id")
-          source_url = res_json.get("source_url")
-          print(f"  📤 Upload Media ID: {media_id} -> {source_url}")
-          return {"id": media_id, "url": source_url}
-        except Exception:
-          return None
-      return None
-    except Exception as e:
-      print(f"  ⚠️ Lỗi upload media: {e}")
-      return None
+            resp = requests.get(self.api_url, headers=self.headers, timeout=15)
+            if resp.status_code != 200:
+                print(f"⚠️ Beebom WP-JSON API trả về HTTP {resp.status_code}")
+                return []
 
-  async def _set_featured_image(self, page, media_id: int):
-    """Gán Featured Image vào bài viết."""
-    print(f"🖼️ Đang gán Featured Image (ID: {media_id})...")
-    try:
-      set_res = await page.evaluate(f"""() => {{
-                let results = [];
-                // 1. Gutenberg Editor
-                if (window.wp && window.wp.data && window.wp.data.dispatch('core/editor')) {{
-                    try {{
-                        window.wp.data.dispatch('core/editor').editPost({{ featured_media: {media_id} }});
-                        results.push('gutenberg');
-                    }} catch(e) {{}}
-                }}
-                // 2. Classic WPSetThumbnailID function
-                if (typeof window.WPSetThumbnailID === 'function') {{
-                    try {{
-                        window.WPSetThumbnailID({media_id});
-                        results.push('WPSetThumbnailID');
-                    }} catch(e) {{}}
-                }}
-                // 3. Classic Hidden Input + events
-                let thumbInput = document.getElementById('_thumbnail_id');
-                if (thumbInput) {{
-                    thumbInput.value = '{media_id}';
-                    thumbInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    thumbInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    results.push('input_value');
-                }}
-                return results;
-            }}""")
-      print(f"  ✅ Đã gán Featured Image qua các phương thức: {set_res}")
-    except Exception as e:
-      print(f"  ⚠️ Không thể set Featured Image: {e}")
+            posts = resp.json()
+            if not isinstance(posts, list):
+                return []
 
-  async def replace_external_images(
-      self, page, html_content: str, slug: str
-  ) -> str:
-    soup = BeautifulSoup(html_content, "html.parser")
-    images = soup.find_all("img")
+            results = []
+            for post in posts:
+                post_id = post.get("id")
+                slug = post.get("slug", "")
+                link = post.get("link", "")
+                raw_title = post.get("title", {}).get("rendered", "")
+                title = html.unescape(raw_title).strip()
+                date_raw = post.get("date", "")
 
-    for idx, img in enumerate(images, 1):
-      src = img.get("src")
-      if not src or not src.startswith("http") or self.site_url in src:
-        continue
+                # Chuẩn hóa thời gian
+                try:
+                    dt = datetime.fromisoformat(date_raw)
+                    date_str = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    date_str = date_raw[:16].replace("T", " ") if date_raw else datetime.now().strftime("%Y-%m-%d %H:%M")
 
-      local_path = ImageHelper.download_and_sanitize_image(
-          image_url=src, slug=slug, output_dir=self.output_dir, index=idx
-      )
-      if local_path:
-        upload_res = await self._upload_file_to_wp(page, local_path)
-        if upload_res and upload_res.get("url"):
-          img["src"] = upload_res["url"]
-          for attr in [
-              "srcset",
-              "data-src",
-              "data-original-src",
-              "data-lazy-src",
-              "sizes",
-          ]:
-            if img.has_attr(attr):
-              del img[attr]
+                article_id = slug if slug else f"beebom_{post_id}"
 
-    return str(soup)
-
-  async def _execute_create_draft(
-      self, article_data: dict, local_image_path: str = None, headless_mode: bool = False
-  ) -> tuple[str, str]:
-    print(
-        f"\n🚀 [Module 4] Đang khởi chạy trình duyệt Playwright (Headless:"
-        f" {headless_mode})..."
-    )
-    playwright = await async_playwright().start()
-    context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=self.profile_dir,
-        headless=headless_mode,
-        viewport={"width": 1366, "height": 850},
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-    )
-
-    page = context.pages[0] if context.pages else await context.new_page()
-    self._headless_now = headless_mode
-
-    try:
-      new_post_url = f"{self.site_url}/wp-admin/post-new.php"
-      print(f"📝 Mở trang tạo bài: {new_post_url}")
-      resp = await page.goto(
-          new_post_url, timeout=60000, wait_until="domcontentloaded"
-      )
-      await asyncio.sleep(2)
-
-      # Kiểm tra và login tự động nếu chưa đăng nhập (kể cả khi wp-admin trả 404)
-      logged_in = await self._ensure_login(page, response=resp, target_url=new_post_url)
-      if not logged_in and headless_mode:
-        raise RuntimeError(f"Chưa vào được wp-admin (Cloudflare chặn hoặc đăng nhập thất bại). URL: {page.url[:100]}")
-
-      # Nếu ở chế độ mở giao diện và bị kẹt trang Login / Cloudflare, chờ người dùng thao tác
-      if not headless_mode and not logged_in:
-        print("\n👉 Cửa sổ trình duyệt đang mở. Vui lòng đăng nhập hoặc xác nhận Cloudflare trên màn hình...")
-        for _ in range(60):
-          await asyncio.sleep(2)
-          if not await self._is_challenge(page) and await self._is_logged_in_admin(page, wait_ms=1000):
-            print("🎉 Đăng nhập thành công, tiếp tục quy trình tạo bài...")
-            await page.goto(new_post_url, timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            break
-
-      if "login" in page.url.lower():
-        await page.goto(
-            new_post_url, timeout=60000, wait_until="domcontentloaded"
-        )
-        await asyncio.sleep(2)
-
-      # Đóng popup Gutenberg modal nếu có
-      try:
-        close_btn = await page.query_selector(
-            "button[aria-label='Close dialog'], button[aria-label='Đóng'],"
-            " .components-modal__header button"
-        )
-        if close_btn:
-          await close_btn.click()
-          await asyncio.sleep(1)
-      except Exception:
-        pass
-
-      # 1. Tải và thay thế link ảnh trong bài
-      slug_val = article_data.get("slug", "crypto-update").strip()
-      clean_html = await self.replace_external_images(
-          page, article_data.get("content_html", ""), slug_val
-      )
-      article_data["content_html"] = clean_html
-
-      # 2. Upload và gán Featured Image
-      if local_image_path and os.path.exists(local_image_path):
-        print(f"📷 Tải Featured Image lên: {local_image_path}")
-        feat_upload = await self._upload_file_to_wp(page, local_image_path)
-        if feat_upload and feat_upload.get("id"):
-          await self._set_featured_image(page, feat_upload["id"])
-
-      # 3. Điền Tiêu đề
-      print(f"✍️ Điền tiêu đề: {article_data['title']}")
-      title_selector = (
-          "h1.wp-block-post-title, textarea.editor-post-title__input,"
-          " #post-title-0, #title"
-      )
-      try:
-        title_elem = await page.wait_for_selector(title_selector, timeout=15000)
-      except Exception:
-        # Phiên đăng nhập có thể hết hạn giữa chừng ➔ thử đăng nhập lại 1 lần
-        print("⚠️ Không thấy ô tiêu đề, thử đăng nhập lại qua trang login...")
-        if not await self._ensure_login(page, target_url=new_post_url):
-          raise RuntimeError(f"Chưa đăng nhập được WordPress ({self.login_url}). URL hiện tại: {page.url}")
-        title_elem = await page.wait_for_selector(title_selector, timeout=20000)
-      if title_elem:
-        await title_elem.click()
-        await page.keyboard.press("Control+A")
-        await page.keyboard.press("Backspace")
-        await page.keyboard.type(article_data["title"])
-
-      # 4. Điền Nội dung bài viết
-      print("📄 Điền nội dung bài viết...")
-      classic_text_tab = await page.query_selector("#content-html")
-      classic_iframe = page.frame(name="content_ifr")
-
-      if classic_text_tab:
-        await classic_text_tab.click()
-        await page.fill("#content", article_data["content_html"])
-      elif classic_iframe:
-        await classic_iframe.evaluate(
-            f"document.getElementById('tinymce').innerHTML ="
-            f" `{article_data['content_html']}`"
-        )
-      else:
-        block = await page.query_selector(
-            ".block-editor-default-block-appender__content,"
-            " .editor-styles-wrapper p, p.wp-block-paragraph"
-        )
-        if block:
-          await block.click()
-          await page.keyboard.insert_text(article_data["content_html"])
-        else:
-          await page.click(".editor-styles-wrapper")
-          await page.keyboard.insert_text(article_data["content_html"])
-
-      await asyncio.sleep(1.5)
-
-      # 5. Gán Slug & Meta Description (Yoast SEO & WordPress Core Excerpt)
-      meta_desc_val = article_data.get("meta_description", "").strip()
-      focus_kw = slug_val.replace("-", " ").title()
-      print(f"⚙️ Gán Slug: '{slug_val}' & Meta Description: '{meta_desc_val[:60]}...'")
-
-      # 5.1. Cập nhật qua Gutenberg Dispatch (Slug, Excerpt & Custom Meta)
-      try:
-        await page.evaluate(
-            """({ slug, excerpt, focusKw }) => {
-                if (window.wp && wp.data && wp.data.dispatch) {
-                    const editor = wp.data.dispatch('core/editor');
-                    if (editor && editor.editPost) {
-                        editor.editPost({
-                            slug: slug,
-                            excerpt: excerpt,
-                            meta: {
-                                _yoast_wpseo_metadesc: excerpt,
-                                yoast_wpseo_metadesc: excerpt,
-                                _yoast_wpseo_focuskw: focusKw
-                            }
-                        });
-                    }
-                }
-            }""",
-            {"slug": slug_val, "excerpt": meta_desc_val, "focusKw": focus_kw},
-        )
-        await page.wait_for_timeout(300)
-      except Exception as e:
-        print(f"⚠️ Dispatch Slug & Meta: {e}")
-
-      # 5.2. Điền Slug vào giao diện Yoast / WordPress UI
-      try:
-        yoast_slug_loc = page.locator(
-            "input#yoast-slug-input, input#yoast-seo-slug, input#edit-slug-box input,"
-            " input[id*='yoast'][id*='slug']"
-        ).first
-        if await yoast_slug_loc.count() > 0:
-          await yoast_slug_loc.scroll_into_view_if_needed(timeout=3000)
-          await yoast_slug_loc.fill(slug_val)
-          await yoast_slug_loc.evaluate(
-              """(el, val) => {
-                  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                  nativeSetter.call(el, val);
-                  el.dispatchEvent(new Event('input', { bubbles: true }));
-                  el.dispatchEvent(new Event('change', { bubbles: true }));
-                  el.dispatchEvent(new Event('blur', { bubbles: true }));
-              }""",
-              slug_val,
-          )
-      except Exception as e:
-        print(f"⚠️ Yoast Slug UI: {e}")
-
-      # 5.3. Điền Meta Description vào Yoast SEO Metabox & Excerpt UI
-      try:
-        filled_desc = await page.evaluate(
-            """({ excerpt, focusKw }) => {
-                let filled = [];
-                let descSelectors = [
-                    '#yoast-google-preview-description-metabox',
-                    '#yoast_wpseo_metadesc',
-                    'textarea[name="yoast_wpseo_metadesc"]',
-                    '#yoast-description-input',
-                    'textarea[id*="yoast"][id*="desc"]',
-                    'textarea[name*="yoast"][name*="desc"]',
-                    '.yoast-field-group textarea',
-                    'textarea.yoast-field-group__textarea',
-                    'div[data-testid*="meta-description"] textarea',
-                    '#excerpt',
-                    'textarea[name="excerpt"]',
-                    'textarea.editor-post-excerpt__textarea'
-                ];
-
-                for (let sel of descSelectors) {
-                    let elems = document.querySelectorAll(sel);
-                    elems.forEach(el => {
-                        if (el) {
-                            try {
-                                el.value = excerpt;
-                                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-                                if (nativeSetter) nativeSetter.call(el, excerpt);
-                                el.dispatchEvent(new Event('input', { bubbles: true }));
-                                el.dispatchEvent(new Event('change', { bubbles: true }));
-                                el.dispatchEvent(new Event('blur', { bubbles: true }));
-                                filled.push(sel);
-                            } catch(e) {}
-                        }
-                    });
-                }
-
-                let kwSelectors = [
-                    '#yoast-focus-keyword',
-                    'input[name="yoast_wpseo_focuskw"]',
-                    '#yoast_wpseo_focuskw',
-                    '#yoast-focus-keyword-input',
-                    'input[id*="yoast"][id*="focus"]'
-                ];
-                for (let sel of kwSelectors) {
-                    let elems = document.querySelectorAll(sel);
-                    elems.forEach(el => {
-                        if (el) {
-                            try {
-                                el.value = focusKw;
-                                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                                if (nativeSetter) nativeSetter.call(el, focusKw);
-                                el.dispatchEvent(new Event('input', { bubbles: true }));
-                                el.dispatchEvent(new Event('change', { bubbles: true }));
-                                el.dispatchEvent(new Event('blur', { bubbles: true }));
-                            } catch(e) {}
-                        }
-                    });
-                }
-
-                return filled;
-            }""",
-            {"excerpt": meta_desc_val, "focusKw": focus_kw},
-        )
-        if filled_desc:
-          print(f"  ✅ Đã điền Meta Description qua DOM: {filled_desc}")
-        else:
-          desc_loc = page.locator(
-              "#yoast-google-preview-description-metabox, #yoast_wpseo_metadesc, textarea[name='yoast_wpseo_metadesc'], #excerpt"
-          ).first
-          if await desc_loc.count() > 0:
-            await desc_loc.scroll_into_view_if_needed(timeout=3000)
-            await desc_loc.fill(meta_desc_val)
-            print("  ✅ Đã điền Meta Description qua Playwright Locator")
-      except Exception as e:
-        print(f"⚠️ Yoast Meta Description UI: {e}")
-
-      # 6. Điền ACF Key Takeaways (Kèm cơ chế Fallback đa tầng)
-      key_takeaways = article_data.get("key_takeaways", [])
-      if key_takeaways and isinstance(key_takeaways, list):
-        print(f"📌 Đang xử lý {len(key_takeaways)} Key Takeaways...")
-        acf_filled = False
-        try:
-          # TẦNG 1: Sử dụng JavaScript DOM để tìm và điền vào ACF Repeater
-          await page.evaluate("window.scrollTo(0, document.body.scrollHeight || document.documentElement.scrollHeight);")
-          await asyncio.sleep(0.5)
-
-          takeaways_json = json.dumps(key_takeaways)
-          acf_filled = await page.evaluate(f"""() => {{
-              let takeaways = {takeaways_json};
-              let repeater = document.querySelector('.acf-field-repeater[data-name="key_takeaways"], .acf-field[data-name="key_takeaways"], .acf-field-repeater:has(.acf-label)');
-              if (!repeater) return false;
-
-              let addBtn = repeater.querySelector('.acf-actions a.acf-button, a[data-event="add-row"], .acf-repeater-add-row, a.acf-button');
-              let existingRows = repeater.querySelectorAll('tbody > tr.acf-row:not(.acf-clone)');
-              
-              // Bấm thêm dòng nếu còn thiếu
-              let attempts = 0;
-              while (existingRows.length < takeaways.length && addBtn && attempts < 10) {{
-                  addBtn.click();
-                  existingRows = repeater.querySelectorAll('tbody > tr.acf-row:not(.acf-clone)');
-                  attempts++;
-              }}
-
-              // Tìm các ô nhập dữ liệu
-              let inputs = repeater.querySelectorAll('tbody > tr.acf-row:not(.acf-clone) input[type="text"], tbody > tr.acf-row:not(.acf-clone) textarea');
-              if (inputs.length === 0) return false;
-
-              takeaways.forEach((text, idx) => {{
-                  if (idx < inputs.length) {{
-                      let input = inputs[idx];
-                      input.value = text;
-                      try {{
-                          let isTextarea = input.tagName.toLowerCase() === 'textarea';
-                          let proto = isTextarea ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-                          let setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-                          if (setter) setter.call(input, text);
-                      }} catch(e) {{}}
-                      input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                      input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                      input.dispatchEvent(new Event('blur', {{ bubbles: true }}));
-                  }}
-              }});
-              return true;
-          }}""")
-
-          if acf_filled:
-            print("  ✅ Đã điền xong Key Takeaways vào ACF qua DOM Script!")
-          else:
-            # TẦNG 2: Sử dụng Playwright Locator với Timeout an toàn
-            repeater_box = page.locator(
-                ".acf-field-repeater:has(.acf-label:has-text('Key Takeaways')),"
-                " .acf-field:has(.acf-label:has-text('Key Takeaways')),"
-                " [data-name='key_takeaways'], .acf-field-repeater"
-            ).first
-
-            if await repeater_box.count() > 0:
-              try:
-                await repeater_box.scroll_into_view_if_needed(timeout=2000)
-              except Exception:
-                pass
-
-              add_btn = repeater_box.locator(
-                  ".acf-actions a.acf-button, a[data-event='add-row'], a:has-text('Add Item'), a:has-text('Add Row')"
-              ).first
-
-              target_total = len(key_takeaways)
-              for _ in range(target_total + 1):
-                current_rows = await repeater_box.locator("tbody > tr.acf-row:not(.acf-clone)").count()
-                if current_rows < target_total and await add_btn.count() > 0:
-                  await add_btn.click(force=True, timeout=2000)
-                  await asyncio.sleep(0.3)
-                else:
-                  break
-
-              input_locators = await repeater_box.locator(
-                  "tbody > tr.acf-row:not(.acf-clone) input[type='text'], tbody > tr.acf-row:not(.acf-clone) textarea"
-              ).all()
-
-              for i, takeaway_text in enumerate(key_takeaways):
-                if i < len(input_locators):
-                  target_input = input_locators[i]
-                  try:
-                    await target_input.scroll_into_view_if_needed(timeout=1500)
-                  except Exception:
-                    pass
-                  await target_input.fill(takeaway_text, timeout=2000)
-                  await target_input.evaluate("""el => {
-                      el.dispatchEvent(new Event('input', { bubbles: true }));
-                      el.dispatchEvent(new Event('change', { bubbles: true }));
-                      el.dispatchEvent(new Event('blur', { bubbles: true }));
-                  }""")
-              print("  ✅ Đã điền xong Key Takeaways vào ACF qua Playwright!")
-              acf_filled = True
+                results.append({
+                    "source": "BEEBOM",
+                    "article_id": article_id,
+                    "title": title,
+                    "url": link,
+                    "date_str": date_str,
+                    "tag": self.tag_name,
+                })
+            return results
         except Exception as e:
-          print(f"⚠️ Không thể điền vào ACF UI: {e}")
+            print(f"⚠️ Lỗi kết nối Beebom API: {e}")
+            return []
 
-        # TẦNG 3 (FALLBACK): Nếu ACF không thể điền, tự động chèn Key Takeaways Box vào nội dung bài viết HTML
-        if not acf_filled:
-          print("ℹ️ [Fallback] Tự động chèn khối Key Takeaways Box vào HTML nội dung bài viết...")
-          try:
-            takeaways_html = (
-                "<div class='wp-block-group key-takeaways-box' style='background: #f8f9fa; border-left: 4px solid #F0B90B; padding: 15px 20px; margin: 20px 0; border-radius: 4px;'>"
-                "<h3 style='margin-top: 0; color: #1e2329; font-size: 1.1rem; font-weight: bold;'>📌 Key Takeaways</h3>"
-                "<ul style='margin-bottom: 0; padding-left: 20px; color: #474d57;'>"
-                + "".join(f"<li style='margin-bottom: 6px;'>{html.escape(t)}</li>" for t in key_takeaways)
-                + "</ul></div>"
-            )
-            current_content = article_data.get("content_html", "")
-            if "<h2" in current_content:
-              updated_content = current_content.replace("<h2", f"{takeaways_html}\n<h2", 1)
-            else:
-              updated_content = f"{takeaways_html}\n{current_content}"
+    def _fetch_via_html(self) -> list[dict]:
+        """Cào HTML từ trang tag Beebom."""
+        try:
+            resp = requests.get(self.tag_url, headers=self.headers, timeout=15)
+            if resp.status_code != 200:
+                print(f"⚠️ Beebom HTML trả về HTTP {resp.status_code}")
+                return []
 
-            # Cập nhật an toàn không gây call stack recursion
-            await page.evaluate("""(newHtml) => {
-                let classicEditor = document.getElementById('content');
-                if (classicEditor) {
-                    classicEditor.value = newHtml;
-                    classicEditor.dispatchEvent(new Event('input', { bubbles: true }));
-                    classicEditor.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-                if (typeof tinyMCE !== 'undefined' && tinyMCE.get('content')) {
-                    tinyMCE.get('content').setContent(newHtml);
-                }
-            }""", updated_content)
-            article_data["content_html"] = updated_content
-            print("  ✅ Đã chèn Key Takeaways Box vào nội dung bài viết!")
-          except Exception as e:
-            print(f"⚠️ Lỗi chèn Fallback Key Takeaways Box: {e}")
+            soup = BeautifulSoup(resp.text, "html.parser")
+            articles = soup.find_all("article")
+            results = []
+
+            for art in articles:
+                a_tag = art.find("a", href=True)
+                if not a_tag:
+                    continue
+
+                url = a_tag["href"]
+                slug = url.strip("/").split("/")[-1]
+                if not slug:
+                    continue
+
+                h_tag = art.find(["h2", "h3"])
+                title = h_tag.get_text(strip=True) if h_tag else slug.replace("-", " ").title()
+
+                time_tag = art.find("time")
+                date_str = time_tag.get_text(strip=True) if time_tag else datetime.now().strftime("%Y-%m-%d %H:%M")
+
+                results.append({
+                    "source": "BEEBOM",
+                    "article_id": slug,
+                    "title": title,
+                    "url": url,
+                    "date_str": date_str,
+                    "tag": self.tag_name,
+                })
+            return results
+        except Exception as e:
+            print(f"⚠️ Lỗi cào HTML Beebom: {e}")
+            return []
 
 
-      # 7. Bấm Lưu bản nháp (Save draft)
-      try:
-        save_btn = await page.query_selector(
-            "button.editor-post-save-draft, button:has-text('Save draft'),"
-            " #save-post"
+# =====================================================================
+# 🔍 6. BỘ QUÉT NGUỒN TELEGRAM CHANNEL (CRYPTORANK FUNDRAISING)
+# =====================================================================
+class TelegramChannelScanner:
+    """
+    Quét web preview công khai của kênh Telegram (https://t.me/s/<channel>):
+    - Không cần Bot API hay đăng nhập: t.me/s/ là trang web công khai của kênh.
+    - Mỗi tin có data-post="<channel>/<số thứ tự>" tăng dần => khóa dedupe ổn định.
+    - Lưu ý: post dạng album (nhiều ảnh) có thể render NHIỀU div trùng data-post,
+      trong đó chỉ một div chứa .tgme_widget_message_text => phải dedupe mỗi lần fetch.
+    """
+
+    # Ký tự vô hình Telegram chèn vào đầu message, phải làm sạch trước khi xử lý
+    _INVISIBLE_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+    # Dòng "quy mô + loại vòng" kiểu "$5.2M Seed Round", "$208M Post-IPO Round".
+    # Loại vòng BẮT BUỘC viết hoa chữ đầu (đặc trưng format kênh) để tránh khớp sai
+    # câu thường kiểu "raised $10M in a funding round" (sẽ trả về rỗng thay vì rác).
+    _AMOUNT_ROUND_RE = re.compile(
+        r"(\$ ?\d[\d.,]* ?[MBK]?)\s*(?:USD)?\s*([A-Z][A-Za-z0-9 ()/&-]*?)\s*Round"
+    )
+
+    def __init__(self, config: dict):
+        self.channel = config.get("CHANNEL", "cryptorank_fundraising")
+        self.web_url = config.get("WEB_URL", f"https://t.me/s/{self.channel}")
+        # Nhãn in log (dùng chung class cho nhiều kênh: CryptoRank, MEXC, ...)
+        self.log_name = config.get("LOG_NAME", "CryptoRank")
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    @classmethod
+    def _clean_text(cls, raw: str) -> str:
+        """Bỏ ký tự vô hình và các dòng trống dư thừa khỏi nội dung tin."""
+        for ch in cls._INVISIBLE_CHARS:
+            raw = raw.replace(ch, "")
+        lines = [line.strip() for line in raw.split("\n")]
+        return "\n".join(line for line in lines if line)
+
+    @classmethod
+    def _parse_amount_round(cls, text: str) -> tuple[str, str]:
+        """
+        Tách quy mô vốn và loại vòng từ nội dung tin.
+        Trả về (amount_str, round_type), ví dụ ("$5.2M", "Seed"); ("", "") nếu không thấy.
+        Giữ nguyên dạng chuỗi để tránh sai số float (tham khảo LESSONS_LEARNED).
+        """
+        # Chuẩn hóa toàn bộ whitespace (kể cả xuống dòng do get_text tách thẻ inline)
+        flat_text = " ".join(text.split())
+        match = cls._AMOUNT_ROUND_RE.search(flat_text)
+        if not match:
+            return "", ""
+        return match.group(1).replace(" ", ""), match.group(2).strip()
+
+    def _parse_message(self, msg) -> Optional[dict]:
+        """Bóc tách 1 khối message của t.me/s thành dict chuẩn hóa, None nếu bỏ qua."""
+        text_div = msg.select_one(".tgme_widget_message_text")
+        if text_div is None:
+            return None  # Tin media-only/service không có nội dung chữ
+
+        full_text = self._clean_text(text_div.get_text("\n"))
+        if not full_text:
+            return None  # Tin chỉ toàn ký tự vô hình/emoji
+
+        data_post = (msg.get("data-post") or "").strip()
+        if not data_post or "/" not in data_post:
+            return None  # Thiếu định danh => không thể dedupe an toàn
+        msg_num = data_post.split("/", 1)[1]
+
+        lines = full_text.split("\n")
+        title = lines[0]
+
+        # time[datetime] của t.me/s luôn là ISO UTC => quy đổi +7h hiển thị UTC+7
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        time_tag = msg.find("time")
+        if time_tag:
+            raw_dt = time_tag.get("datetime", "")
+            try:
+                # Python 3.8 không hỗ trợ hậu tố 'Z' trong fromisoformat
+                clean_dt = raw_dt.replace("Z", "+00:00")
+                dt_utc = datetime.fromisoformat(clean_dt)
+                date_str = (dt_utc + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                print(f"⚠️ [{self.log_name}] datetime lạ '{raw_dt}' ở tin {data_post}, dùng thời gian hiện tại.")
+
+        amount, round_type = self._parse_amount_round(full_text)
+
+        # Link dự án trên cryptorank.io (nếu có) nhúng trong nội dung tin
+        project_url = ""
+        for a_tag in text_div.find_all("a", href=True):
+            if "cryptorank.io" in a_tag["href"]:
+                project_url = a_tag["href"]
+                break
+
+        return {
+            "source": "CRYPTORANK",
+            "article_id": data_post,
+            "title": title,
+            "url": f"https://t.me/{self.channel}/{msg_num}",
+            "full_text": full_text,
+            "amount_formatted": amount if amount else "Không công bố",
+            "round_type": round_type if round_type else "Fundraising",
+            "project_url": project_url,
+            "date_str": date_str,
+        }
+
+    def fetch_latest_messages(self) -> list[dict]:
+        """Tải web preview kênh Telegram và bóc tách các tin gần nhất."""
+        try:
+            resp = requests.get(self.web_url, headers=self.headers, timeout=15)
+            if resp.status_code == 429:
+                print(f"⚠️ [{self.log_name}] Telegram đang throttle (HTTP 429), đợi chu kỳ kế tiếp.")
+                return []
+            if resp.status_code != 200:
+                print(f"⚠️ [{self.log_name}] HTTP {resp.status_code} khi tải {self.web_url}")
+                return []
+        except requests.RequestException as e:
+            print(f"⚠️ [{self.log_name}] Lỗi kết nối t.me: {e}")
+            return []
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Dedupe theo data-post: album render nhiều div trùng nhau, giữ div đầu có text
+        results: dict[str, dict] = {}
+        for msg in soup.select(".tgme_widget_message"):
+            parsed = self._parse_message(msg)
+            if parsed is not None and parsed["article_id"] not in results:
+                results[parsed["article_id"]] = parsed
+
+        if not results:
+            print(f"⚠️ [{self.log_name}] Tải trang OK nhưng parse được 0 tin — DOM của t.me/s có thể đã đổi, cần kiểm tra lại parser!")
+        return list(results.values())
+
+
+class MEXCChannelScanner(TelegramChannelScanner):
+    """
+    Quét kênh Telegram thông báo chính thức của MEXC (@MEXC_OfficialAnnouncements,
+    được dẫn link từ mexc.com). Lý do không quét mexc.com trực tiếp: toàn bộ site
+    chặn client không phải trình duyệt bằng Akamai (HTTP 403).
+    Mỗi tin kết thúc bằng hashtag chuyên mục (#Latest_Events, #New_Listings, ...).
+    """
+
+    _TAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
+
+    def _parse_message(self, msg) -> Optional[dict]:
+        parsed = super()._parse_message(msg)
+        if parsed is None:
+            return None
+
+        tags = self._TAG_RE.findall(parsed["full_text"])
+        # Link bài gốc trên mexc.com nằm ở nút inline bên dưới tin (ngoài khối text);
+        # bỏ tham số utm cho gọn
+        article_url = ""
+        for a_tag in msg.find_all("a", href=True):
+            if "mexc.com/announcements/article/" in a_tag["href"]:
+                article_url = a_tag["href"].split("?", 1)[0]
+                break
+
+        return {
+            "source": "MEXC",
+            "article_id": parsed["article_id"],
+            "title": parsed["title"],
+            "url": article_url or parsed["url"],
+            "tg_url": parsed["url"],
+            "tags": tags,
+            "category": tags[-1].replace("_", " ") if tags else "Announcement",
+            "date_str": parsed["date_str"],
+        }
+
+
+# =====================================================================
+# 🔍 7. BỘ QUÉT NGUỒN TECHCRUNCH FUNDRAISING (WP-JSON API)
+# =====================================================================
+class TechCrunchScanner:
+    """
+    Quét category Fundraising của TechCrunch qua WP-JSON REST API:
+    - API chính xác, nhanh và ổn định hơn cào HTML (cùng cơ chế nguồn Beebom).
+    - Category này bị TechCrunch lẫn bài sự kiện/quảng cáo (VD "Disrupt 2026 Day 2"),
+      nên lọc thêm 1 lớp từ khóa tiêu đề để chỉ giữ tin vòng gọi vốn thật.
+    """
+
+    def __init__(self, config: dict):
+        self.category_name = config.get("CATEGORY_NAME", "Fundraising")
+        self.api_url = config.get(
+            "API_URL",
+            "https://techcrunch.com/wp-json/wp/v2/posts?categories=577234943&per_page=15",
         )
-        if save_btn:
-          await save_btn.click()
-          await asyncio.sleep(4)
-          print("💾 Đã bấm Save Draft thành công.")
-      except Exception as e:
-        print(f"⚠️ Bỏ qua lỗi click Save Draft: {e}")
+        self.title_keywords = [kw.lower() for kw in config.get("TITLE_KEYWORDS", [])]
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        }
 
-      draft_url = page.url
-      await context.close()
-      await playwright.stop()
-      return draft_url, "Success"
+    @staticmethod
+    def _strip_html_tags(raw_html: str) -> str:
+        """Bóc sạch thẻ HTML trong excerpt do WP-JSON trả về dạng rendered."""
+        return re.sub(r"<[^>]+>", "", raw_html or "").strip()
 
-    except Exception as e:
-      err_msg = str(e)
-      print(f"⚠️ Lỗi tạo bài viết: {err_msg}")
-      try:
-        await context.close()
-        await playwright.stop()
-      except Exception:
-        pass
-      return "Failed", err_msg
+    def _is_funding_article(self, title: str) -> bool:
+        """Khớp từ khóa tiêu đề theo word-boundary (không phân biệt hoa thường)."""
+        if not self.title_keywords:
+            return True  # Không cấu hình từ khóa => nhận tất cả bài trong category
+        lowered = title.lower()
+        for keyword in self.title_keywords:
+            # \b đầu từ khóa là prefix-stem match: "round" khớp "rounds" nhưng
+            # KHÔNG khớp "background"/"surround" (trước 'r' là ký tự chữ).
+            pattern = r"\b" + re.escape(keyword)
+            if re.search(pattern, lowered):
+                return True
+        return False
 
-  async def create_draft(
-      self, article_data: dict, local_image_path: str = None
-  ) -> tuple[str, str]:
-    # 1. Thử tạo bài với cấu hình hiện tại
-    draft_url, status = await self._execute_create_draft(
-        article_data=article_data,
-        local_image_path=local_image_path,
-        headless_mode=self.headless,
-    )
-    if status == "Success":
-      return draft_url, status
+    def fetch_latest_articles(self) -> list[dict]:
+        """Lấy danh sách bài fundraising mới nhất từ WP-JSON API của TechCrunch."""
+        try:
+            resp = requests.get(self.api_url, headers=self.headers, timeout=15)
+            if resp.status_code != 200:
+                print(f"⚠️ [TechCrunch] WP-JSON API trả về HTTP {resp.status_code}")
+                return []
+            posts = resp.json()
+            if not isinstance(posts, list):
+                print(f"⚠️ [TechCrunch] Response không đúng định dạng danh sách: {type(posts)}")
+                return []
+        except (requests.RequestException, ValueError) as e:
+            print(f"⚠️ [TechCrunch] Lỗi kết nối/phân tích API: {e}")
+            return []
 
-    # 2. Nếu thất bại ở chế độ headless, tự động mở cửa sổ trình duyệt (Headless: False)
-    if self.headless:
-      print("\n⚠️ Đăng bài Headless chưa thành công. Tự động mở cửa sổ trình duyệt (Headless: False) để xử lý...")
-      draft_url, status = await self._execute_create_draft(
-          article_data=article_data,
-          local_image_path=local_image_path,
-          headless_mode=False,
-      )
-    return draft_url, status
+        results = []
+        skipped = 0
+        for post in posts:
+            post_id = post.get("id")
+            slug = post.get("slug", "")
+            link = post.get("link", "")
+            raw_title = (post.get("title") or {}).get("rendered", "")
+            title = html.unescape(raw_title).strip()
+            date_raw = post.get("date", "")
+            raw_excerpt = (post.get("excerpt") or {}).get("rendered", "")
+            excerpt = html.unescape(self._strip_html_tags(raw_excerpt))[:300]
 
+            if not title or (not slug and not post_id):
+                print(f"⚠️ [TechCrunch] Bỏ qua post thiếu title hoặc id: {post}")
+                continue
 
-# =====================================================================
-# 📦 MODULE 5: CSV LOGGER (Ghi lịch sử dữ liệu)
-# =====================================================================
-class CSVLogger:
+            if not self._is_funding_article(title):
+                skipped += 1
+                continue
 
-  def __init__(self, file_path: str):
-    self.file_path = file_path
-    self.headers = [
-        "STT",
-        "Date",
-        "Source URL",
-        "Post Title",
-        "Post Slug",
-        "Meta Description",
-        "Categories",
-        "Draft URL",
-        "Image Status",
-        "Status",
-    ]
-    self._init_csv()
+            try:
+                # Python 3.8 không hỗ trợ hậu tố 'Z' trong fromisoformat
+                clean_date = date_raw.replace("Z", "+00:00") if date_raw else ""
+                dt = datetime.fromisoformat(clean_date)
+                date_str = dt.strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                date_str = date_raw[:16].replace("T", " ") if date_raw else datetime.now().strftime("%Y-%m-%d %H:%M")
 
-  def _init_csv(self):
-    if not os.path.exists(self.file_path):
-      with open(
-          self.file_path, mode="w", newline="", encoding="utf-8-sig"
-      ) as f:
-        writer = csv.writer(f)
-        writer.writerow(self.headers)
+            results.append({
+                "source": "TECHCRUNCH",
+                "article_id": slug if slug else f"techcrunch_{post_id}",
+                "title": title,
+                "url": link,
+                "excerpt": excerpt,
+                "date_str": date_str,
+                "category": self.category_name,
+            })
 
-  def _get_next_stt(self) -> int:
-    try:
-      with open(
-          self.file_path, mode="r", newline="", encoding="utf-8-sig"
-      ) as f:
-        return len(list(csv.reader(f)))
-    except Exception:
-      return 1
-
-  def log_article(
-      self,
-      source_url: str,
-      article_data: dict,
-      draft_url: str,
-      img_status: str,
-      status: str,
-  ):
-    stt = self._get_next_stt()
-    row = [
-        stt,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        source_url,
-        article_data.get("title", ""),
-        article_data.get("slug", ""),
-        article_data.get("meta_description", ""),
-        article_data.get("categories", ""),
-        draft_url,
-        img_status,
-        status,
-    ]
-    with open(self.file_path, mode="a", newline="", encoding="utf-8-sig") as f:
-      writer = csv.writer(f)
-      writer.writerow(row)
-    print(f"📁 [Module 5] Đã ghi dòng #{stt} vào: {self.file_path}")
+        if skipped > 0:
+            print(f"  ℹ️ [TechCrunch] Đã lọc bỏ {skipped} bài không phải tin gọi vốn (theo từ khóa tiêu đề).")
+        return results
 
 
 # =====================================================================
-# 📦 MODULE 6: TELEGRAM NOTIFIER (Gửi báo cáo khi lên bài xong)
+# 🔍 8. BỘ QUÉT NGUỒN BIZZZTOR (STARTUP & VC FUNDING NEWS)
 # =====================================================================
-class TelegramNotifier:
+class BizztorScanner:
+    """Cào bài viết mới nhất từ chuyên mục tin tức Bizztor (https://bizztor.com/news/)."""
 
-  def __init__(self, config: dict):
-    self.enabled = config.get("ENABLE", True)
-    self.bot_token = config.get("BOT_TOKEN")
-    self.chat_id = config.get("CHAT_ID")
-    self.brand_name = config.get("BRAND_NAME")
+    def __init__(self, config: dict):
+        self.base_url = config.get("BASE_URL", "https://bizztor.com/news/")
+        self.timeout = config.get("TIMEOUT", 15)
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
 
-  def send_post_notification(
-      self,
-      title: str,
-      source_url: str,
-      draft_url: str,
-      ai_score: int,
-      img_status: str,
-      brand_name: str = None,
-  ):
-    if not self.enabled or not self.bot_token or not self.chat_id:
-      return
+    @staticmethod
+    def _extract_amount_and_round(title: str) -> tuple[str, str]:
+        """Trích xuất quy mô vốn ($/€/£) và vòng gọi vốn từ tiêu đề bài viết Bizztor."""
+        # 1. Regex tìm số tiền: $125M, €60M, £4.6M, $2.1 Billion, £200,000, $50M...
+        amount = "Không công bố"
+        amount_match = re.search(
+            r'([$€£]\s*[\d]+(?:\.[\d]+)?\s*(?:Billion|Million|B|M|k|K)?|[\d]+(?:\.[\d]+)?\s*(?:million|billion)\s*(?:pounds|euros|dollars)?)',
+            title,
+            re.IGNORECASE
+        )
+        if amount_match:
+            amount = amount_match.group(1).strip()
 
-    brand = (
-        brand_name
-        or self.brand_name
-        or ("VENTUREBURN BOT" if "ventureburn" in draft_url.lower() else "CHAINPLAY BOT")
-    )
-    print(f"📢 [Module 6] Đang gửi thông báo kết quả ({brand}) về Telegram...")
-    try:
-      now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-      msg_text = (
-          f"🚀 <b>[{brand}] ĐÃ TẠO BÀI NHÁP (DRAFT) THÀNH CÔNG!</b>\n\n"
-          f"📌 <b>Tiêu đề:</b> {html.escape(title)}\n"
-          f"🔗 <b>Link gốc Binance:</b> <a href='{source_url}'>Xem thông báo gốc</a>\n"
-          f"📝 <b>Link WP Draft:</b> <a href='{draft_url}'>Xem bài nháp</a>\n"
-          f"🔍 <b>AI Score:</b> {ai_score}%\n"
-          f"🎨 <b>Ảnh bìa:</b> {img_status}\n"
-          f"⏰ <b>Thời gian:</b> {now_str}\n"
-      )
+        # 2. Regex tìm vòng gọi vốn: Pre-Seed, Seed, Series A-F...
+        round_type = "Fundraising"
+        round_match = re.search(
+            r'\b(Pre-Seed|Seed|Series\s+[A-F](?:\s+Extension)?|Growth|First Close|Debt|Bridge|Grant)\b',
+            title,
+            re.IGNORECASE
+        )
+        if round_match:
+            round_type = round_match.group(1).strip()
 
-      api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-      payload = {
-          "chat_id": self.chat_id,
-          "text": msg_text,
-          "parse_mode": "HTML",
-          "disable_web_page_preview": False,
-      }
-      resp = requests.post(api_url, json=payload, timeout=15)
-      if resp.status_code == 200:
-        print(f"✅ Đã gửi thông báo Telegram thành công (Chat ID: {self.chat_id})")
-      else:
-        print(f"⚠️ Gửi Telegram thất bại (HTTP {resp.status_code}): {resp.text}")
-    except Exception as e:
-      print(f"⚠️ Lỗi kết nối Telegram Notifier: {e}")
+        return amount, round_type
 
+    def _parse_html(self, html_text: str) -> list[dict]:
+        """Tách riêng logic parse HTML để có thể kiểm thử (unit test) offline không cần mạng."""
+        soup = BeautifulSoup(html_text, "html.parser")
+        articles = []
+        seen_slugs = set()
 
-# =====================================================================
-# 🚀 PIPELINE ORCHESTRATOR
-# =====================================================================
-async def run_news_automation_pipeline(
-    news_url: str,
-    article_code: str,
-    default_title: str = None,
-    platform: str = "VB",
-):
-  platform_mode = platform.upper()
-  if platform_mode == "BOTH":
-    print("🚀 [Multi-Platform] Kích hoạt chế độ đăng kép: Ventureburn (VB) ➔ Chainplay (CP)...")
-    print("\n" + "=" * 60 + "\n--- [BƯỚC 1/2] ĐĂNG BÀI LÊN VENTUREBURN (VB) ---\n" + "=" * 60)
-    await run_news_automation_pipeline(news_url, article_code, default_title, platform="VB")
-    print("\n⏳ Nghỉ 3 giây trước khi chuyển sang Chainplay...")
-    await asyncio.sleep(3)
-    print("\n" + "=" * 60 + "\n--- [BƯỚC 2/2] ĐĂNG BÀI LÊN CHAINPLAY (CP) ---\n" + "=" * 60)
-    await run_news_automation_pipeline(news_url, article_code, default_title, platform="CP")
-    print("\n🏁 [Multi-Platform] Đã hoàn thành toàn bộ quy trình cho cả 2 nền tảng!")
-    return
+        # Bizztor đặt tiêu đề tin trong h2/h3 kèm thẻ a có href chứa /news/
+        for h in soup.find_all(["h2", "h3"]):
+            a = h.find("a")
+            if not a:
+                continue
 
-  cfg = get_platform_config(platform_mode)
-  scanner = BinanceScanner(config=cfg.get("BINANCE", {}))
-  ai_processor = AIProcessor(
-      api_key=cfg["GEMINI_API_KEY"],
-      model_id=cfg["MODELS"]["MAIN_AI"],
-      csv_log_path=cfg["CSV_LOG_PATH"],
-      site_url=cfg["WORDPRESS"]["SITE_URL"],
-      platform=platform_mode,
-  )
-  ai_checker = AICheckerModule(
-      api_key=cfg["GEMINI_API_KEY"],
-      check_model=cfg["MODELS"]["CHECK_AI"],
-      rewrite_model=cfg["MODELS"]["REWRITE_AI"],
-  )
-  image_engine = HFImageEngine(config=cfg.get("IMAGE", {}))
-  wp_publisher = WordPressPublisher(config=cfg.get("WORDPRESS", {}))
-  csv_logger = CSVLogger(file_path=cfg["CSV_LOG_PATH"])
-  tg_notifier = TelegramNotifier(config=cfg.get("TELEGRAM_NOTIFY", {}))
+            href = (a.get("href") or "").strip()
+            if not href or href in ("https://bizztor.com/news/", "/news/", "https://bizztor.com/news"):
+                continue
 
-  try:
-    # 1. Cào tin chi tiết & Bảng số liệu
-    raw_data = scanner.extract_article_detail(
-        article_code=article_code, default_url=news_url
-    )
-    if not raw_data.get("content"):
-      print("❌ Dừng pipeline do không lấy được nội dung nguồn.")
-      return
+            # Chuẩn hóa URL tuyệt đối
+            if href.startswith("/"):
+                url = "https://bizztor.com" + href
+            else:
+                url = href
 
-    if default_title and (
-        not raw_data.get("title")
-        or raw_data.get("title") == "Binance Announcement Update"
-    ):
-      raw_data["title"] = default_title
+            # Trích xuất slug bài viết làm article_id
+            clean_path = href.split("?")[0].rstrip("/")
+            slug = clean_path.split("/")[-1]
+            if not slug or slug in ("news", "page") or slug.startswith("page"):
+                continue
 
-    # 2. Main AI biên tập sang tiếng Anh chuẩn SEO theo nền tảng
-    article_data = ai_processor.process(raw_data)
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
 
-    # 2.5. Check điểm AI & Humanize nếu cần
-    article_data = ai_checker.process(
-        article_data, threshold=cfg["AI_THRESHOLD"]
-    )
+            title = a.get_text(strip=True)
+            if not title or len(title) < 15:
+                continue
 
-    # 3. Tạo poster/banner 16:9 kèm Logo & Màu thương hiệu
-    img_path, img_status = image_engine.generate_and_download(
-        prompt=article_data.get("image_prompt", ""),
-        slug=article_data.get("slug", "crypto-update"),
-    )
+            amount, round_type = self._extract_amount_and_round(title)
 
-    # 4. Đăng WordPress Draft
-    draft_url, post_status = await wp_publisher.create_draft(
-        article_data=article_data, local_image_path=img_path
-    )
+            # Tìm đoạn văn tóm tắt lân cận (nếu có)
+            excerpt = ""
+            parent = h.find_parent()
+            if parent:
+                p_tag = parent.find("p")
+                if p_tag:
+                    excerpt = p_tag.get_text(strip=True)
 
-    # 5. Ghi Log CSV
-    csv_logger.log_article(
-        source_url=news_url,
-        article_data=article_data,
-        draft_url=draft_url,
-        img_status=img_status,
-        status=post_status,
-    )
+            date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # 6. Gửi Thông Báo Telegram
-    ai_score_val = article_data.get("ai_score", 0)
-    tg_notifier.send_post_notification(
-        title=article_data.get("title", default_title),
-        source_url=news_url,
-        draft_url=draft_url,
-        ai_score=ai_score_val,
-        img_status=img_status,
-        brand_name=cfg["TELEGRAM_NOTIFY"].get("BRAND_NAME"),
-    )
+            articles.append({
+                "source": "BIZZTOR",
+                "article_id": slug,
+                "title": title,
+                "url": url,
+                "excerpt": excerpt,
+                "amount_formatted": amount,
+                "round_type": round_type,
+                "date_str": date_str,
+            })
 
-  except Exception as e:
-    print(f"❌ Lỗi Pipeline ({platform_mode}): {e}")
+        return articles
+
+    def fetch_latest_articles(self) -> list[dict]:
+        """Gửi request cào danh sách bài viết từ https://bizztor.com/news/."""
+        try:
+            resp = requests.get(self.base_url, headers=self.headers, timeout=self.timeout)
+            if resp.status_code == 200:
+                articles = self._parse_html(resp.text)
+                return articles
+            elif resp.status_code == 429:
+                print(f"⚠️ [Bizztor] Bị giới hạn tần suất (HTTP 429).")
+                return []
+            else:
+                print(f"⚠️ [Bizztor] Lỗi HTTP {resp.status_code} khi tải {self.base_url}")
+                return []
+        except requests.Timeout:
+            print(f"⚠️ [Bizztor] Hết thời gian chờ (Timeout {self.timeout}s) khi kết nối {self.base_url}")
+            return []
+        except Exception as e:
+            print(f"⚠️ [Bizztor] Lỗi khi cào dữ liệu: {e}")
+            return []
 
 
 # =====================================================================
-# 📡 MODULE 7: BINANCE ANNOUNCEMENT TRIGGER & KEYWORD FILTER
+# 🔍 8b. BỘ QUÉT NGUỒN OKX ANNOUNCEMENTS (REST API CÔNG KHAI)
 # =====================================================================
-def matches_keywords(
-    title: str,
-    whitelist: list[str],
-    blacklist: list[str] = None,
-) -> tuple[bool, str]:
-  search_target = title.lower()
+class OKXScanner:
+    """Truy vấn API thông báo công khai của OKX (GET /api/v5/support/announcements)."""
 
-  if blacklist:
-    for b_kw in blacklist:
-      clean_b = b_kw.strip().lower()
-      if clean_b and clean_b in search_target:
-        return False, f"Chứa từ khóa cấm: '{b_kw}'"
+    # Nhãn chuyên mục (theo /api/v5/support/announcement-types, bản vi-VN)
+    TYPE_NAMES = {
+        "announcements-new-listings": "Token mới niêm yết",
+        "announcements-delistings": "Hủy niêm yết",
+        "latest-events": "Sự kiện mới nhất",
+        "announcements-trading-updates": "Cập nhật giao dịch",
+        "announcements-deposit-withdrawal-suspension-resumption": "Tạm ngưng nạp/rút",
+        "announcements-p2p-trading": "Giao dịch P2P",
+        "announcements-web3": "Web3",
+        "announcements-earn-and-loan": "Earn và Vay",
+        "announcements-jumpstart": "Jumpstart",
+        "announcements-api": "API",
+        "announcements-okb-buy-back-burn": "Đốt OKB",
+        "announcements-others": "Khác",
+    }
 
-  clean_whitelist = [w.strip().lower() for w in (whitelist or []) if w.strip()]
-  if clean_whitelist:
-    for w_kw in clean_whitelist:
-      if w_kw in search_target:
-        return True, f"Khớp từ khóa mục tiêu: '{w_kw}'"
-    return (
-        False,
-        f"Không chứa từ khóa yêu cầu ({', '.join(clean_whitelist[:5])}...)",
-    )
+    def __init__(self, config: dict):
+        self.api_url = config.get("API_URL", "https://www.okx.com/api/v5/support/announcements")
+        self.timeout = config.get("TIMEOUT", 15)
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Accept-Language": config.get("LANGUAGE", "vi-VN"),
+        }
 
-  return True, "Chấp nhận tất cả"
+    def fetch_latest_articles(self) -> list[dict]:
+        """Lấy trang đầu (20 thông báo mới nhất) của toàn bộ chuyên mục."""
+        try:
+            resp = requests.get(self.api_url, headers=self.headers, timeout=self.timeout)
+            if resp.status_code != 200:
+                print(f"⚠️ [OKX] Lỗi HTTP {resp.status_code} khi gọi API thông báo")
+                return []
 
+            payload = resp.json()
+            if str(payload.get("code")) != "0":
+                print(f"⚠️ [OKX] API trả lỗi code={payload.get('code')}: {payload.get('msg')}")
+                return []
 
-async def check_binance_for_new_announcements(
-    scanner: BinanceScanner,
-    seen_articles: set,
-    keyword_whitelist: list[str],
-    keyword_blacklist: list[str],
-):
-  print(f"\n🔍 [{datetime.now().strftime('%H:%M:%S')}] Đang quét các danh mục thông báo Binance...")
-  try:
-    latest_articles = scanner.get_latest_articles()
-    if not latest_articles:
-      print("ℹ️ Không tìm thấy bài viết nào trong lần quét này.")
-      return
+            results = []
+            for page in payload.get("data") or []:
+                for ann in page.get("details") or []:
+                    url = (ann.get("url") or "").strip()
+                    title = html.unescape(ann.get("title") or "").strip()
+                    if not url or not title:
+                        continue
 
-    # Lần đầu chạy: Khởi tạo mốc các bài hiện có
-    if not seen_articles:
-      for art in latest_articles:
-        seen_articles.add(art["code"])
-      print(
-          f"📌 Đã khởi tạo mốc cơ sở: Ghi nhớ {len(seen_articles)} bài viết hiện"
-          " có trên Binance."
-      )
-      return
+                    # Slug cuối URL không phụ thuộc ngôn ngữ (/vi/help/x == /help/x)
+                    # => đổi LANGUAGE cũng không bị bắn lại tin cũ
+                    article_id = url.rstrip("/").rsplit("/", 1)[-1]
 
-    # Duyệt các bài mới phát sinh
-    for art in latest_articles:
-      code = art["code"]
-      if code in seen_articles:
-        continue
+                    ann_type = ann.get("annType", "")
+                    p_time = ann.get("pTime")
+                    try:
+                        date_str = datetime.fromtimestamp(int(p_time) / 1000).strftime("%Y-%m-%d %H:%M")
+                    except (TypeError, ValueError):
+                        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-      title = art["title"]
-      article_url = art["url"]
-
-      print("\n" + "=" * 70)
-      print(f"⚡ [THÔNG BÁO BINANCE MỚI] Code: {code}")
-      print(f"🎯 Tiêu đề: {title}")
-      print(f"🔗 Link: {article_url}")
-
-      # Kiểm tra bộ lọc từ khóa
-      is_matched, reason = matches_keywords(
-          title=title,
-          whitelist=keyword_whitelist,
-          blacklist=keyword_blacklist,
-      )
-
-      seen_articles.add(code)
-
-      if not is_matched:
-        print(f"⏭️ [BỎ QUA DO LỌC TỪ KHÓA] {reason}")
-        continue
-
-      print(f"🎉 [ĐỦ ĐIỀU KIỆN TRIGGER] {reason}")
-      print("🚀 BẮT ĐẦU CHẠY PIPELINE BIÊN TẬP & ĐĂNG BÀI (MODULES 1 -> 6)...")
-      print("=" * 70)
-
-      await run_news_automation_pipeline(
-          news_url=article_url, article_code=code, default_title=title
-      )
-      print(f"\n✅ Hoàn tất xử lý thông báo [{code}]! Tiếp tục theo dõi...\n")
-
-  except Exception as e:
-    print(f"⚠️ Lỗi quét Binance Announcements: {e}")
+                    results.append({
+                        "source": "OKX",
+                        "article_id": article_id,
+                        "ann_type": ann_type,
+                        "type_name": self.TYPE_NAMES.get(ann_type, ann_type or "Thông báo"),
+                        "title": title,
+                        "url": url,
+                        "date_str": date_str,
+                    })
+            return results
+        except requests.Timeout:
+            print(f"⚠️ [OKX] Hết thời gian chờ (Timeout {self.timeout}s) khi gọi API")
+            return []
+        except Exception as e:
+            print(f"⚠️ [OKX] Lỗi khi quét thông báo: {e}")
+            return []
 
 
-async def main():
-  binance_cfg = CONFIG["BINANCE"]
-  poll_interval = binance_cfg["POLL_INTERVAL_SECONDS"]
-  scanner = BinanceScanner(config=binance_cfg)
+# =====================================================================
+# 🚀 9. DAEMON CHÍNH CHẠY NGẦM 24/7 (ASYNC ENGINE)
+# =====================================================================
+class MultiNewsNotifierDaemon:
+    """Điều phối toàn bộ vòng lặp kiểm tra và thông báo tin mới đa nguồn."""
 
-  print("=" * 75)
-  print("🤖 AUTO BINANCE ANNOUNCEMENTS TO WORDPRESS BOT (24/7 PRODUCTION)")
-  print("=" * 75)
-  print(f"📋 Danh mục Binance quét: {binance_cfg['CATALOG_IDS']} (List 93, 49, 48)")
-  print(f"🔍 Từ khóa mục tiêu: {binance_cfg['KEYWORD_WHITELIST']}")
-  print(f"🚫 Từ khóa cấm: {binance_cfg['KEYWORD_BLACKLIST']}")
-  print(f"📢 Telegram Báo Cáo: Chat ID {CONFIG['TELEGRAM_NOTIFY']['CHAT_ID']}")
-  print(f"⏱️ Chu kỳ quét: {poll_interval} giây ({poll_interval // 60} phút / lần)")
-  print("=" * 75)
+    def __init__(self):
+        self.storage = StorageManager(db_path=CONFIG["DB_PATH"])
+        self.telegram = TelegramAlertService(config=CONFIG["TELEGRAM"])
+        self.binance_scanner = BinanceScanner(config=CONFIG["BINANCE"])
+        self.dealroom_scanner = DealroomScanner(config=CONFIG["DEALROOM"])
+        self.beebom_scanner = BeebomScanner(config=CONFIG.get("BEEBOM", {}))
+        self.cryptorank_scanner = TelegramChannelScanner(config=CONFIG["CRYPTORANK"])
+        self.techcrunch_scanner = TechCrunchScanner(config=CONFIG.get("TECHCRUNCH", {}))
+        self.bizztor_scanner = BizztorScanner(config=CONFIG.get("BIZZTOR", {}))
+        self.okx_scanner = OKXScanner(config=CONFIG.get("OKX", {}))
+        self.mexc_scanner = MEXCChannelScanner(config=CONFIG.get("MEXC", {}))
 
-  seen_articles = set()
+    def initialize_baseline(self):
+        """
+        Mốc cơ sở áp dụng LAZY theo từng nguồn (chống spam tin cũ khi mạng chưa sẵn sàng):
+        - Nguồn nào trong DB chưa có bản ghi nào (chạy lần đầu hoặc vừa thêm nguồn mới),
+          lần fetch THÀNH CÔNG ĐẦU TIÊN sẽ chỉ ghi nhớ mốc im lặng, KHÔNG bắn tin cũ.
+        - Cơ chế nằm trong _process_source_items() được gọi bởi các hàm check_*_now().
+        """
+        print(
+            f"📌 Trạng thái SQLite: {self.storage.count_seen()} tin đã ghi nhận "
+            f"(Binance: {self.storage.count_seen('BINANCE')} | Dealroom: {self.storage.count_seen('DEALROOM')} | "
+            f"Beebom: {self.storage.count_seen('BEEBOM')} | CryptoRank: {self.storage.count_seen('CRYPTORANK')} | "
+            f"TechCrunch: {self.storage.count_seen('TECHCRUNCH')} | Bizztor: {self.storage.count_seen('BIZZTOR')} | "
+            f"OKX: {self.storage.count_seen('OKX')} | MEXC: {self.storage.count_seen('MEXC')})"
+        )
 
-  # Quét lần đầu để thiết lập mốc
-  await check_binance_for_new_announcements(
-      scanner=scanner,
-      seen_articles=seen_articles,
-      keyword_whitelist=binance_cfg["KEYWORD_WHITELIST"],
-      keyword_blacklist=binance_cfg["KEYWORD_BLACKLIST"],
-  )
+    def _process_source_items(self, source: str, items: list[dict], notify_single, notify_batch, mark_one) -> int:
+        """
+        Xử lý chung cho mọi nguồn tin: lazy baseline -> lọc tin mới -> gửi Telegram
+        (đơn hoặc gom batch) -> CHỈ mark_seen những tin gửi THÀNH CÔNG để không
+        đánh mất tin khi Telegram API lỗi (tin chưa mark sẽ được thử lại chu kỳ sau).
+        Trả về số tin đã được ghi nhận an toàn vào DB.
+        """
+        if not items:
+            return 0
 
-  print(
-      "\n🟢 HỆ THỐNG ĐANG HOẠT ĐỘNG. SẼ TỰ ĐỘNG QUÉT MỖI"
-      f" {poll_interval // 60} PHÚT...\n"
-  )
+        # Lazy baseline: nguồn chưa từng có bản ghi nào -> seed mốc im lặng, KHÔNG notify
+        if self.storage.count_seen(source) == 0:
+            for it in items:
+                mark_one(it)
+            print(f"📌 [Baseline] Nguồn {source}: ghi nhớ im lặng {len(items)} tin hiện có (lần đầu tiên).")
+            return len(items)
 
-  while True:
-    try:
-      await asyncio.sleep(poll_interval)
-      await check_binance_for_new_announcements(
-          scanner=scanner,
-          seen_articles=seen_articles,
-          keyword_whitelist=binance_cfg["KEYWORD_WHITELIST"],
-          keyword_blacklist=binance_cfg["KEYWORD_BLACKLIST"],
-      )
-    except asyncio.CancelledError:
-      print("\n🛑 Bot đã nhận lệnh dừng.")
-      break
-    except Exception as e:
-      print(f"⚠️ Lỗi vòng lặp chính: {e}")
-      await asyncio.sleep(10)
+        new_items = [it for it in items if not self.storage.is_seen(source, it["article_id"])]
+        if not new_items:
+            return 0
+
+        print(f"🔥 [TIN MỚI PHÁT HIỆN] {source}: Tìm thấy {len(new_items)} tin mới!")
+
+        acknowledged = 0
+        if CONFIG.get("BATCH_MODE", True) and len(new_items) > 1:
+            if notify_batch(new_items):
+                for it in new_items:
+                    mark_one(it)
+                acknowledged = len(new_items)
+            else:
+                print(f"⚠️ Gửi Telegram thất bại -> giữ {len(new_items)} tin {source} để thử lại chu kỳ sau.")
+        else:
+            for it in new_items:
+                if notify_single(it):
+                    mark_one(it)
+                    acknowledged += 1
+                else:
+                    print(f"⚠️ Gửi 1 tin {source} thất bại -> sẽ thử lại chu kỳ sau.")
+                time.sleep(1)
+        return acknowledged
+
+    def check_binance_now(self):
+        """Quét và xử lý tin mới từ Binance (Hỗ trợ gom tin theo Batch)."""
+        if not CONFIG["BINANCE"]["ENABLE"]:
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét thông báo Binance (Catalog 49 & 93)...")
+        articles = self.binance_scanner.fetch_latest_articles()
+        if not articles:
+            print(f"[{now_str}] ℹ️ Binance: Không có dữ liệu.")
+            return
+
+        self._process_source_items(
+            source="BINANCE",
+            items=articles,
+            notify_single=self.telegram.notify_binance_article,
+            notify_batch=self.telegram.notify_binance_batch,
+            mark_one=lambda art: self.storage.mark_seen(
+                source="BINANCE",
+                article_id=art["article_id"],
+                catalog_or_lens=str(art["catalog_id"]),
+                title=art["title"],
+                url=art["url"],
+            ),
+        )
+
+    def check_dealroom_now(self):
+        """Quét và xử lý tin mới từ Dealroom (Hỗ trợ gom tin theo Batch)."""
+        if not CONFIG["DEALROOM"]["ENABLE"]:
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét tin tức Dealroom (Funding & IPO)...")
+        deals = self.dealroom_scanner.fetch_latest_deals()
+        if not deals:
+            print(f"[{now_str}] ℹ️ Dealroom: Không có dữ liệu.")
+            return
+
+        self._process_source_items(
+            source="DEALROOM",
+            items=deals,
+            notify_single=self.telegram.notify_dealroom_deal,
+            notify_batch=self.telegram.notify_dealroom_batch,
+            mark_one=lambda deal: self.storage.mark_seen(
+                source="DEALROOM",
+                article_id=deal["article_id"],
+                catalog_or_lens=deal["lens"],
+                title=deal["title"],
+                url=deal["url"],
+                amount=deal.get("raw_amount", ""),
+            ),
+        )
+
+    def check_beebom_now(self):
+        """Quét và xử lý tin mới từ Beebom Roblox Codes (Hỗ trợ gom tin theo Batch)."""
+        if not CONFIG.get("BEEBOM", {}).get("ENABLE", False):
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét bài viết Beebom (Roblox Codes)...")
+        articles = self.beebom_scanner.fetch_latest_articles()
+        if not articles:
+            print(f"[{now_str}] ℹ️ Beebom: Không có dữ liệu.")
+            return
+
+        self._process_source_items(
+            source="BEEBOM",
+            items=articles,
+            notify_single=self.telegram.notify_beebom_article,
+            notify_batch=self.telegram.notify_beebom_batch,
+            mark_one=lambda art: self.storage.mark_seen(
+                source="BEEBOM",
+                article_id=art["article_id"],
+                catalog_or_lens="roblox-codes",
+                title=art["title"],
+                url=art["url"],
+            ),
+        )
+
+    def check_cryptorank_now(self):
+        """Quét kênh Telegram @cryptorank_fundraising và xử lý tin mới (Batch)."""
+        if not CONFIG["CRYPTORANK"]["ENABLE"]:
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét kênh Telegram @{self.cryptorank_scanner.channel} (Fundraising)...")
+        items = self.cryptorank_scanner.fetch_latest_messages()
+        if not items:
+            print(f"[{now_str}] ℹ️ CryptoRank: Không tải được tin hoặc không có tin nào.")
+            return
+
+        self._process_source_items(
+            source="CRYPTORANK",
+            items=items,
+            notify_single=self.telegram.notify_cryptorank_article,
+            notify_batch=self.telegram.notify_cryptorank_batch,
+            mark_one=lambda it: self.storage.mark_seen(
+                source="CRYPTORANK",
+                article_id=it["article_id"],
+                catalog_or_lens="fundraising",
+                title=it["title"],
+                url=it["url"],
+                amount=it.get("amount_formatted", ""),
+            ),
+        )
+
+    def check_techcrunch_now(self):
+        """Quét bài TechCrunch Fundraising và xử lý tin mới (Batch)."""
+        if not CONFIG.get("TECHCRUNCH", {}).get("ENABLE", False):
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét TechCrunch ({CONFIG['TECHCRUNCH']['CATEGORY_NAME']})...")
+        articles = self.techcrunch_scanner.fetch_latest_articles()
+        if not articles:
+            print(f"[{now_str}] ℹ️ TechCrunch: Không có dữ liệu.")
+            return
+
+        self._process_source_items(
+            source="TECHCRUNCH",
+            items=articles,
+            notify_single=self.telegram.notify_techcrunch_article,
+            notify_batch=self.telegram.notify_techcrunch_batch,
+            mark_one=lambda art: self.storage.mark_seen(
+                source="TECHCRUNCH",
+                article_id=art["article_id"],
+                catalog_or_lens="fundraising",
+                title=art["title"],
+                url=art["url"],
+            ),
+        )
+
+    def check_bizztor_now(self):
+        """Quét bài viết Bizztor Startup News và xử lý tin mới (Batch)."""
+        if not CONFIG.get("BIZZTOR", {}).get("ENABLE", False):
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét Bizztor Startup News...")
+        articles = self.bizztor_scanner.fetch_latest_articles()
+        if not articles:
+            print(f"[{now_str}] ℹ️ Bizztor: Không có dữ liệu.")
+            return
+
+        self._process_source_items(
+            source="BIZZTOR",
+            items=articles,
+            notify_single=self.telegram.notify_bizztor_article,
+            notify_batch=self.telegram.notify_bizztor_batch,
+            mark_one=lambda art: self.storage.mark_seen(
+                source="BIZZTOR",
+                article_id=art["article_id"],
+                catalog_or_lens="news",
+                title=art["title"],
+                url=art["url"],
+                amount=art.get("amount_formatted", ""),
+            ),
+        )
+
+    def check_okx_now(self):
+        """Quét thông báo mới nhất của OKX và xử lý tin mới (Batch)."""
+        if not CONFIG.get("OKX", {}).get("ENABLE", False):
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét thông báo OKX (Latest Announcements)...")
+        articles = self.okx_scanner.fetch_latest_articles()
+        if not articles:
+            print(f"[{now_str}] ℹ️ OKX: Không có dữ liệu.")
+            return
+
+        self._process_source_items(
+            source="OKX",
+            items=articles,
+            notify_single=self.telegram.notify_okx_article,
+            notify_batch=self.telegram.notify_okx_batch,
+            mark_one=lambda art: self.storage.mark_seen(
+                source="OKX",
+                article_id=art["article_id"],
+                catalog_or_lens=art["ann_type"],
+                title=art["title"],
+                url=art["url"],
+            ),
+        )
+
+    def check_mexc_now(self):
+        """Quét kênh Telegram thông báo MEXC, chỉ gửi tin thuộc hashtag đã chọn (Batch)."""
+        mexc_cfg = CONFIG.get("MEXC", {})
+        if not mexc_cfg.get("ENABLE", False):
+            return
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"[{now_str}] 🔍 Đang quét kênh Telegram @{self.mexc_scanner.channel} (MEXC)...")
+        items = self.mexc_scanner.fetch_latest_messages()
+        if not items:
+            print(f"[{now_str}] ℹ️ MEXC: Không tải được tin hoặc không có tin nào.")
+            return
+
+        def mark_one(it):
+            self.storage.mark_seen(
+                source="MEXC",
+                article_id=it["article_id"],
+                catalog_or_lens=",".join(it["tags"]),
+                title=it["title"],
+                url=it["url"],
+            )
+
+        include = set(mexc_cfg.get("INCLUDE_TAGS") or [])
+        wanted = [it for it in items if not include or include.intersection(it["tags"])]
+
+        # Baseline trên TOÀN BỘ tin (không chỉ tin đúng tag): nếu baseline chỉ dựa vào tin
+        # đúng tag thì khi chưa có tin nào khớp, tin khớp đầu tiên sẽ bị nuốt im lặng.
+        if self.storage.count_seen("MEXC") == 0:
+            for it in items:
+                mark_one(it)
+            print(f"📌 [Baseline] Nguồn MEXC: ghi nhớ im lặng {len(items)} tin hiện có (lần đầu tiên).")
+            return
+
+        # Tin ngoài bộ lọc: ghi nhận im lặng để không phải xét lại mỗi chu kỳ
+        for it in items:
+            if it not in wanted and not self.storage.is_seen("MEXC", it["article_id"]):
+                mark_one(it)
+
+        self._process_source_items(
+            source="MEXC",
+            items=wanted,
+            notify_single=self.telegram.notify_mexc_article,
+            notify_batch=self.telegram.notify_mexc_batch,
+            mark_one=mark_one,
+        )
+
+    async def run_daemon(self):
+        """Vòng lặp chạy ngầm chính bất đồng bộ."""
+        print("=" * 75)
+        print("🤖 MULTI-NEWS TELEGRAM NOTIFIER DAEMON ĐANG KHỞI CHẠY (24/7)")
+        print("=" * 75)
+        print(f"📍 File Database SQLite: {CONFIG['DB_PATH']}")
+        print(f"📢 Telegram Chat ID: {CONFIG['TELEGRAM']['CHAT_ID']}")
+        print(f"📦 Chế độ gom tin Batch: {'BẬT (Khuyên dùng)' if CONFIG.get('BATCH_MODE') else 'TẮT'}")
+        dealroom_status = (
+            f"{CONFIG['DEALROOM']['POLL_INTERVAL_SECONDS']}s"
+            if CONFIG["DEALROOM"]["ENABLE"]
+            else "TẮT (Cloudflare chặn 403)"
+        )
+        print(
+            f"⏱️ Chu kỳ quét: Binance ({CONFIG['BINANCE']['POLL_INTERVAL_SECONDS']}s) | "
+            f"Dealroom ({dealroom_status}) | "
+            f"Beebom ({CONFIG.get('BEEBOM', {}).get('POLL_INTERVAL_SECONDS', 180)}s) | "
+            f"CryptoRank TG ({CONFIG['CRYPTORANK']['POLL_INTERVAL_SECONDS']}s) | "
+            f"TechCrunch ({CONFIG.get('TECHCRUNCH', {}).get('POLL_INTERVAL_SECONDS', 300)}s) | "
+            f"Bizztor ({CONFIG.get('BIZZTOR', {}).get('POLL_INTERVAL_SECONDS', 300)}s) | "
+            f"OKX ({CONFIG.get('OKX', {}).get('POLL_INTERVAL_SECONDS', 120)}s) | "
+            f"MEXC TG ({CONFIG.get('MEXC', {}).get('POLL_INTERVAL_SECONDS', 300)}s)"
+        )
+        print("=" * 75)
+
+        # 1. In trạng thái mốc dữ liệu hiện có (baseline thực tế là LAZY per-source)
+        self.initialize_baseline()
+
+        binance_interval = CONFIG["BINANCE"]["POLL_INTERVAL_SECONDS"]
+        dealroom_interval = CONFIG["DEALROOM"]["POLL_INTERVAL_SECONDS"]
+        beebom_interval = CONFIG.get("BEEBOM", {}).get("POLL_INTERVAL_SECONDS", 180)
+        cryptorank_interval = CONFIG["CRYPTORANK"]["POLL_INTERVAL_SECONDS"]
+        techcrunch_interval = CONFIG.get("TECHCRUNCH", {}).get("POLL_INTERVAL_SECONDS", 300)
+        bizztor_interval = CONFIG.get("BIZZTOR", {}).get("POLL_INTERVAL_SECONDS", 300)
+        okx_interval = CONFIG.get("OKX", {}).get("POLL_INTERVAL_SECONDS", 120)
+        mexc_interval = CONFIG.get("MEXC", {}).get("POLL_INTERVAL_SECONDS", 300)
+
+        last_binance_check = 0.0
+        last_dealroom_check = 0.0
+        last_beebom_check = 0.0
+        last_cryptorank_check = 0.0
+        last_techcrunch_check = 0.0
+        last_bizztor_check = 0.0
+        last_okx_check = 0.0
+        last_mexc_check = 0.0
+
+        print("🟢 HỆ THỐNG ĐÃ SẴN SÀNG VÀ BẮT ĐẦU LẮNG NGHE TIN TỨC 24/7...\n")
+
+        while IS_RUNNING:
+            now = time.time()
+
+            # 1. Quét Binance theo chu kỳ
+            if now - last_binance_check >= binance_interval:
+                try:
+                    self.check_binance_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ Binance: {e}")
+                last_binance_check = time.time()
+
+            # 2. Quét Dealroom theo chu kỳ
+            if now - last_dealroom_check >= dealroom_interval:
+                try:
+                    self.check_dealroom_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ Dealroom: {e}")
+                last_dealroom_check = time.time()
+
+            # 3. Quét Beebom theo chu kỳ
+            if now - last_beebom_check >= beebom_interval:
+                try:
+                    self.check_beebom_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ Beebom: {e}")
+                last_beebom_check = time.time()
+
+            # 4. Quét kênh Telegram CryptoRank theo chu kỳ
+            if now - last_cryptorank_check >= cryptorank_interval:
+                try:
+                    self.check_cryptorank_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ CryptoRank: {e}")
+                last_cryptorank_check = time.time()
+
+            # 5. Quét TechCrunch Fundraising theo chu kỳ
+            if now - last_techcrunch_check >= techcrunch_interval:
+                try:
+                    self.check_techcrunch_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ TechCrunch: {e}")
+                last_techcrunch_check = time.time()
+
+            # 6. Quét Bizztor Startup News theo chu kỳ
+            if now - last_bizztor_check >= bizztor_interval:
+                try:
+                    self.check_bizztor_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ Bizztor: {e}")
+                last_bizztor_check = time.time()
+
+            # 7. Quét OKX Announcements theo chu kỳ
+            if now - last_okx_check >= okx_interval:
+                try:
+                    self.check_okx_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ OKX: {e}")
+                last_okx_check = time.time()
+
+            # 8. Quét kênh Telegram thông báo MEXC theo chu kỳ
+            if now - last_mexc_check >= mexc_interval:
+                try:
+                    self.check_mexc_now()
+                except Exception as e:
+                    print(f"⚠️ Lỗi chu kỳ MEXC: {e}")
+                last_mexc_check = time.time()
+
+            # Sleep ngắn để kiểm tra cờ tắt chương trình thường xuyên
+            await asyncio.sleep(2)
+
+        print("👋 Bot đã dừng hoạt động an toàn. Hẹn gặp lại!")
 
 
 if __name__ == "__main__":
-  try:
-    asyncio.run(main())
-  except KeyboardInterrupt:
-    print("\n🛑 Đã dừng bot an toàn bằng phím tắt Ctrl+C.")
-    sys.exit(0)
+    daemon = MultiNewsNotifierDaemon()
+    asyncio.run(daemon.run_daemon())
+
